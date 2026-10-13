@@ -424,6 +424,40 @@ class ServeTests(unittest.TestCase):
         self.assertEqual(v["llamacpp:requests_deferred"], 0)
         self.assertEqual(v["llamacpp:kv_cache_usage_ratio"], 0)  # fake engine: no get_cache_stats
 
+    def test_metrics_without_drafting(self):
+        """--num-draft 0: plain decode must report 0 rounds/draft tokens, not divide by the window."""
+        from aiohttp.test_utils import TestClient, TestServer
+
+        class NoDraftGenerator(FakeGenerator):
+            num_draft_tokens = 0
+
+        class NoDraftEngine(FakeEngine):
+            def __init__(self, output: str):
+                super().__init__(output)
+                self.greedy_generator = NoDraftGenerator()
+
+            async def generate(self, prompt, **kwargs):
+                self.prompts.append(prompt)
+                self.last_stats = {"cached_tokens": 8, "new_tokens": 4, "prompt_tokens": 20,
+                                   "time_prefill": 0.5, "time_generate": 1.0,
+                                   "accepted_draft_tokens": 0, "rejected_draft_tokens": 0}
+                yield self.output
+
+        async def check():
+            client = TestClient(TestServer(serve.create_app(NoDraftEngine("hello there"), "m", self.template)))
+            await client.start_server()
+            await client.post("/v1/chat/completions", json={
+                "model": "m", "messages": [{"role": "user", "content": "one two three four"}]})
+            text = await (await client.get("/metrics")).text()
+            await client.close()
+            return text
+
+        v = metrics_samples(run(check()))
+        self.assertEqual(v["llamacpp:spec_decode_num_drafts_total"], 0)
+        self.assertEqual(v["llamacpp:spec_decode_num_draft_tokens_total"], 0)
+        self.assertEqual(v["llamacpp:spec_decode_num_accepted_tokens_total"], 0)
+        self.assertEqual(v["llamacpp:tokens_predicted_total"], 4)  # the request itself is still counted
+
     def test_stream_handler_finishes_after_stream(self):
         """After a streamed reply the handler returns; it must not fall into the non-stream path
         and wait forever on an empty queue."""

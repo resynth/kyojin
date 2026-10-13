@@ -28,7 +28,12 @@ call, a streamed call, a tool call, and two 400-token benchmark calls.
 | `--chat-template` | `tools/lanes/assets/glm53-template-medium.jinja` | Jinja template file. The default is the model's template with a `medium` effort level added; `<model>/chat_template.jinja` is the unchanged one |
 | `--default-temperature` / `--default-top-p` | from `generation_config.json` (`1.0` / `0.95`) | used when a request omits the field (explicit null too). Greedy defaults loop on agent clients that send no sampling |
 | `--default-reasoning-effort` | `medium` | template `reasoning_effort` when a request omits it: `low`, `medium`, `high` or `max` |
-| `--max-history` | `1` | recurrent history slots; must equal draft tokens (1 for MTP). Each extra slot costs ~2.15 GiB |
+| `--num-draft` | `2` | MTP draft tokens per round; `0` = do not load the MTP drafter at all (saves its weights, the draft cache and the history slots; slower decode, `/metrics` shows 0 draft tokens) |
+| `--max-history` | `1` | recurrent history slots; must equal draft tokens (1 for MTP). Each extra slot costs ~2.15 GiB. Ignored (forced 0) with `--num-draft 0` |
+
+Slot files follow the drafter: a slot saved with MTP on holds main+draft cache tensors and
+will not restore under `--num-draft 0` (nor vice versa); the restore then fails with a clear
+tensor-count error.
 
 Env vars the server sets for itself via `os.environ.setdefault` (so an external value
 wins): `EXL3_MOE_UNION_V2=1`, `EXL3_MOE_CFG=2`, `EXL3_HIP_PREFILL_MIN_ROWS=2`,

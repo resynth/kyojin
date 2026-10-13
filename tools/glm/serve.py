@@ -345,20 +345,27 @@ class ResidentEngine:
                            max_history=max_history)
         startup_health.stage("target weights")
         self.model.load(device="cuda:0", progressbar=False, callback=startup_health.load_callback())
-        self.draft_model = Model.from_config(self.config, component="mtp")
-        self.draft_cache = Cache(self.draft_model, max_num_tokens=ctx + 4096,
-                                 max_history=max_history)
-        startup_health.stage("drafter weights")
-        self.draft_model.load(device="cuda:0", progressbar=False, callback=startup_health.load_callback())
+        self.draft_model = self.draft_cache = None
+        if num_draft:  # --num-draft 0: no MTP weights, no draft cache: plain decode
+            self.draft_model = Model.from_config(self.config, component="mtp")
+            self.draft_cache = Cache(self.draft_model, max_num_tokens=ctx + 4096,
+                                     max_history=max_history)
+            startup_health.stage("drafter weights")
+            self.draft_model.load(device="cuda:0", progressbar=False, callback=startup_health.load_callback())
         self.vision = None
         self.emb_cache: collections.OrderedDict = collections.OrderedDict()
         if vision:
             self.vision = self._load_vision()
         self.supports_vision = self.vision is not None
-        self.greedy_generator = Generator(
-            model=self.model, cache=self.cache, tokenizer=self.tokenizer,
-            draft_model=self.draft_model, draft_cache=self.draft_cache, num_draft_tokens=num_draft,
-            record_draft_stats=True)
+        if self.draft_model is not None:
+            self.greedy_generator = Generator(
+                model=self.model, cache=self.cache, tokenizer=self.tokenizer,
+                draft_model=self.draft_model, draft_cache=self.draft_cache, num_draft_tokens=num_draft,
+                record_draft_stats=True)
+        else:
+            self.greedy_generator = Generator(
+                model=self.model, cache=self.cache, tokenizer=self.tokenizer,
+                record_draft_stats=True)
         # n1f2: one drafted token, fused catch-up variant 2. One Generator only: a second one over the
         # same Cache takes ownership and breaks the first. Sampling also goes through MTP: a draft is
         # kept only when the independently sampled target token equals it, so outputs follow the target.
@@ -976,8 +983,13 @@ def main() -> None:
     parser.add_argument("--model-id", default="glm-5.3-exl3")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--num-draft", type=int, default=2, help="MTP draft tokens per round (2 = R=3 verify, round2 27/09)")
-    parser.add_argument("--max-history", type=int, default=None, help="recurrent state history slots; default = --num-draft. Each extra slot costs ~2.15 GiB")
+    parser.add_argument("--num-draft", type=int, default=2,
+                        help="MTP draft tokens per round (2 = R=3 verify, round2 27/09); "
+                             "0 = do not load the MTP drafter at all (saves its weights, the draft cache "
+                             "and history slots; slower decode)")
+    parser.add_argument("--max-history", type=int, default=None,
+                        help="recurrent state history slots; default = --num-draft. Each extra slot costs ~2.15 GiB. "
+                             "Ignored (forced 0) with --num-draft 0")
     parser.add_argument("-c", "--max-ctx", type=int, default=131072, help="context window (capped by max_position_embeddings)")
     parser.add_argument("--slot-save-path", default="~/cache/llama-slots",
                         help="directory for /slots save/restore files (llama.cpp compatible)")
@@ -993,6 +1005,13 @@ def main() -> None:
     parser.add_argument("--default-reasoning-effort", choices=("low", "medium", "high", "max"), default=None,
                         help="thinking effort when a request omits it (default: medium)")
     args = parser.parse_args()
+    if args.num_draft < 0:
+        parser.error("--num-draft must be >= 0")
+    if args.num_draft == 0:
+        # history slots only serve spec-decode rewind: without a drafter they are pure cost (~2.15 GiB each)
+        if args.max_history:
+            print("serve: --max-history is ignored with --num-draft 0 (forced to 0)", flush=True)
+        args.max_history = 0
     if args.no_uncensor:
         os.environ["EXL3_ABLIT_RUNTIME"] = "off"
     SERVE_DEFAULTS.update(pack_sampling(args.model))
@@ -1005,7 +1024,7 @@ def main() -> None:
     apply_eh_sidecar_default(args.model)
     warm = os.environ.get("EXL3_SERVE_WARMUP", "1") != "0"
     tune = warm and float(os.environ.get("EXL3_SERVE_DTUNE_PRIME_S", "600")) > 0
-    stages = ["target weights", "drafter weights"] + ([] if args.no_vision else ["vision tower"]) + (["warm-up"] if warm else []) + (["dense GEMM tuning"] if tune else [])
+    stages = ["target weights"] + ([] if args.num_draft == 0 else ["drafter weights"]) + ([] if args.no_vision else ["vision tower"]) + (["warm-up"] if warm else []) + (["dense GEMM tuning"] if tune else [])
     startup_health.check_model_dir("serve", args.model, ("config.json",))
     # A start with the dense GEMM tuning already cached is much shorter than the first one: keep their timings apart.
     startup_health.start("glm", stages, args.host, args.port, routes=ROUTES,
@@ -1042,7 +1061,8 @@ def main() -> None:
                 print(f"serve: dense GEMM prime {keys} keys {secs:.1f} s", flush=True)
                 print(mem_line("primed"), flush=True)
         from exllamav3.generator.slot_store import SlotStore
-        engine.slot_store = SlotStore(engine.greedy_generator, [engine.cache, engine.draft_cache],
+        engine.slot_store = SlotStore(engine.greedy_generator,
+                                      [engine.cache] if engine.draft_cache is None else [engine.cache, engine.draft_cache],
                                       args.slot_save_path, args.model_id)
         if os.environ.get("EXL3_SERVE_RSS_LOG"):  # rssleak1: per-request host-RSS accounting, off by default
             sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
