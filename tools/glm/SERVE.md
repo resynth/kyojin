@@ -30,21 +30,11 @@ call, a streamed call, a tool call, and two 400-token benchmark calls.
 | `--default-reasoning-effort` | `medium` | template `reasoning_effort` when a request omits it: `low`, `medium`, `high` or `max` |
 | `--max-history` | `1` | recurrent history slots; must equal draft tokens (1 for MTP). Each extra slot costs ~2.15 GiB |
 | `-c`, `--max-ctx` | `131072` | context window in tokens, shared by all sessions |
-| `--cache-bits` | `0` | `0` = fp16 MLA latent pages (default); `8` = packed int8 latent pages, target and MTP draft caches together. The DSA indexer and k-pool planes and the shared rope key stay fp16, so the saving is a smaller fraction than the latent-only 1.7×. Greedy output stays coherent but differs token-wise from fp16. The startup line prints `serve: cache=int8`; slot files do not cross modes (a cross-mode restore fails with `slot file cache layout does not match`) |
+| `--cache-bits` | `0` | `0` = fp16 MLA latent pages (default); `8` = packed int8 latent pages, target and MTP draft caches together. The DSA indexer and k-pool planes and the shared rope key stay fp16, so the saving is a smaller fraction than the latent-only 1.7×. Greedy output stays coherent but differs token-wise from fp16. |
 | `--sessions` | `1` | requests decoded together through the one model (multi-user). `1` = one request at a time, others wait |
 | `--row-budget` | `5` when `--sessions` > 1 | caps the verify rows per round by lowering the draft depth when several sessions are busy; `0` = off |
 | `--num-draft` | `2` | draft tokens per speculative round; `0` = plain decode, no drafter |
 | `--exact-prefix-cache` | off | a request resumed from the prompt cache gives the same greedy text as its cold prefill. Costs about 5-12 % of cold prefill speed at 7-14K tokens |
-
-`--cache-bits 8` stores the MLA latent cache (GLM's only paged attention) in the packed int8
-format, the same machinery as the Qwen server's flag. The GLM-5.3-specific planes of the cache —
-the fp16 DSA indexer keys and the k-pool plane — and the shared rope key stay fp16, so the GiB
-saved per token is less than the latent-only 1.7× ratio: measured memory, PPL, MTP accept rate and
-decode tok/s deltas on the 128 GB card are pending (`tools/glm/ppl7.py` protocol, `mem_line` at
-200K+ context). The int8 pages are not row-invariant when several rows decode together (the Qwen
-precedent); that caveat does not apply to GLM's current serving shape — revisit this line if the
-batched verify changes. Tuning knobs if decode throughput moves: `EXL3_MLA_QC_BN`,
-`EXL3_MLA_QC_TRANS`.
 
 Env vars the server sets for itself via `os.environ.setdefault` (so an external value
 wins): `EXL3_CONV_GEMM=1`, `EXL3_DENSE_GEMM_TUNE=0`, `EXL3_MOE_UNION_V2=1`, `EXL3_MOE_CFG=2`, `EXL3_HIP_PREFILL_MIN_ROWS=2`,
