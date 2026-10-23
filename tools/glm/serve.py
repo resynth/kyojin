@@ -28,6 +28,7 @@ import serve_compat  # noqa: E402  (vLLM-style token-id prompts, cache_salt, /to
 # serve_metrics.py is a symlink to the shared tools/strix_halo/serve_metrics.py
 from serve_metrics import Metrics
 from image_cache import ImageEmbeddingCache, digest
+from cache_bits import quant_cache_kwargs
 
 DEFAULT_MODEL = "~/models/glm53-exl3-td205"
 EH_SIDECAR_DEFAULT = "~/models/glm53-mtp-eh-proj-bf16.safetensors"
@@ -368,9 +369,7 @@ class ResidentEngine:
         self.ctx = ctx
         # cache_bits 0 (default) = the fp16 MLA latent pages; 8 (--cache-bits 8) = packed int8 latent pages. The DSA
         # indexer and k-pool planes and the rope key stay fp16, so the saving is smaller than the latent-only ratio.
-        self.cache_bits = cache_bits
-        from exllamav3 import CacheLayer_quant
-        qkw = dict(layer_type=CacheLayer_quant, k_bits=cache_bits, v_bits=cache_bits) if cache_bits else {}
+        qkw = quant_cache_kwargs(cache_bits)
         self.cache = Cache(self.model, max_num_tokens=ctx + 4096,
                            max_history=max_history, **qkw)
         startup_health.stage("target weights")

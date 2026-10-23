@@ -13,18 +13,8 @@ import numpy as np
 import torch
 
 from exllamav3 import Config, Model, Cache
-from exllamav3.cache import CacheLayer_quant
 
-
-def gtt_gb():
-    import glob
-    best = 0
-    for p in glob.glob("/sys/class/drm/card*/device/mem_info_gtt_used"):
-        try:
-            best = max(best, int(open(p).read()))
-        except Exception:
-            pass
-    return best / 2**30
+from cache_bits import quant_cache_kwargs
 
 
 def planes(layer):
@@ -49,7 +39,7 @@ def main():
     print(f"model={a.model} max_ctx={a.max_ctx} max_num_tokens={nt} page={256}")
     for comp in (None, "mtp"):
         for cb in (0, 8):
-            kw = dict(layer_type=CacheLayer_quant, k_bits=cb, v_bits=cb) if cb else {}
+            kw = quant_cache_kwargs(cb)
             m = Model.from_config(cfg, component=comp) if comp else Model.from_config(cfg)
             c = Cache(m, max_num_tokens=nt, max_history=2, **kw)
             raw = sum(l.storage_size() for l in c.layers.values())

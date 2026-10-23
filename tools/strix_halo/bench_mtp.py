@@ -14,6 +14,7 @@ import argparse, os, sys, time
 import torch
 
 sys.path.insert(0, os.path.expanduser("~/kyojin"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "glm"))
 
 ap = argparse.ArgumentParser()
 ap.add_argument("-m", "--model", default=os.path.expanduser("~/models/Qwen3.8-Flash-Next-EXL3"))
@@ -58,10 +59,8 @@ def main():
     #   RuntimeError: recurrent_state must be [num_slots, max_history + 1, ...]
     NDT = args.num_draft_tokens if args.num_draft_tokens is not None else 4
     MH = 0 if args.no_mtp else NDT
-    qkw = {}
-    if args.cache_bits:
-        from exllamav3 import CacheLayer_quant
-        qkw = dict(layer_type=CacheLayer_quant, k_bits=args.cache_bits, v_bits=args.cache_bits)
+    from cache_bits import quant_cache_kwargs
+    qkw = quant_cache_kwargs(args.cache_bits)
     cache = Cache(model, max_num_tokens=args.cache, max_history=MH, **qkw)
     model.load(progressbar=False)
 

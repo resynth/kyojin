@@ -17,8 +17,6 @@ usage:
 import argparse, json, random, string, time
 from pathlib import Path
 
-from serve_accept import post  # tools/glm on sys.path
-
 LOREM = (
     "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod "
     "tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, "
