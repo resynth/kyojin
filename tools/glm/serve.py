@@ -1408,7 +1408,8 @@ def main() -> None:
     parser.add_argument("-c", "--max-ctx", type=int, default=131072, help="context window (capped by max_position_embeddings)")
     parser.add_argument("--cache-bits", type=int, default=0, choices=(0, 8),
                         help="bits per element of the MLA latent cache pages (0 = fp16, the default; 8 = packed int8; the DSA "
-                             "indexer and k-pool planes and the rope key stay fp16; output differs token-wise from fp16)")
+                             "indexer and k-pool planes and the rope key stay fp16; output differs token-wise from fp16; slot "
+                             "files do not cross cache modes, and a cross-mode restore is rejected)")
     parser.add_argument("--slot-save-path", default="~/cache/llama-slots",
                         help="directory for /slots save/restore files (llama.cpp compatible)")
     parser.add_argument("--chat-template", default=None,
@@ -1430,6 +1431,10 @@ def main() -> None:
               f"(per-session window = -c / sessions when all are busy); greedy output is not guaranteed equal to the same "
               f"request run alone; slot save/restore waits for every running request and acts on the last prompt noted",
               file=sys.stderr, flush=True)
+    if args.cache_bits and args.sessions > 1:
+        print(f"serve: --cache-bits {args.cache_bits} with --sessions {args.sessions}: the packed int8 MLA pages are not "
+              f"row-invariant, so batched decode changes greedy output versus a single session (the rows still agree with "
+              f"each other). Slot files also do not cross cache modes.", file=sys.stderr, flush=True)
     if args.no_uncensor:
         os.environ["EXL3_ABLIT_RUNTIME"] = "off"
     SERVE_DEFAULTS.update(pack_sampling(args.model))
@@ -1457,7 +1462,7 @@ def main() -> None:
         template = Path(args.chat_template or DEFAULT_TEMPLATE).expanduser().read_text(encoding="utf-8")
         print(mem_line("loaded"), flush=True)
         print(f"serve: vision={engine.supports_vision}", flush=True)
-        print(f"serve: cache={'int' + str(args.cache_bits) if args.cache_bits else 'fp16'}", flush=True)
+        print(f"serve: cache={'int' + str(args.cache_bits) + ' (slot files do not cross cache modes)' if args.cache_bits else 'fp16'}", flush=True)
         # Warm-up before the slot store is attached, so the warm-up prompt never shows in /slots.
         # EXL3_SERVE_WARMUP=0 skips it.
         if os.environ.get("EXL3_SERVE_WARMUP", "1") != "0":
