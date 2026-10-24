@@ -14,6 +14,7 @@ import argparse, os, sys, time
 import torch
 
 sys.path.insert(0, os.path.expanduser("~/kyojin"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "glm"))
 
 ap = argparse.ArgumentParser()
 ap.add_argument("-m", "--model", default=os.path.expanduser("~/models/Qwen3.8-Flash-Next-EXL3"))
@@ -22,6 +23,11 @@ ap.add_argument("-n", "--num_tokens", type=int, default=64)
 ap.add_argument("-c", "--cache", type=int, default=4096)
 ap.add_argument("-ndt", "--num_draft_tokens", type=int, default=None)
 ap.add_argument("--no-mtp", action="store_true")
+ap.add_argument("--cache-bits", type=int, default=0, choices=(0, 8),
+                help="0 = fp16 MLA latent cache (default); 8 = packed int8 latent pages. "
+                     "Applied to both the target and MTP draft cache, as tools/glm/serve.py does")
+ap.add_argument("--temp", type=float, default=None,
+                help="Sampling temperature; 0 = greedy. Unset keeps this harness's default sampler")
 ap.add_argument("-dds", "--dynamic", action="store_true")
 ap.add_argument("-dc", "--draft_confidence", type=float, default=0.4)
 ap.add_argument("-g", "--greedy", action="store_true",
@@ -36,7 +42,8 @@ def main():
     from exllamav3 import Config, Model, Cache, Tokenizer, Generator, Job
 
     print(f"family={X.exl3_gemv_wmma_family(0)}  mtp={'OFF' if args.no_mtp else 'ON'}"
-          f"  ndt={args.num_draft_tokens}  dynamic={args.dynamic}", flush=True)
+          f"  ndt={args.num_draft_tokens}  dynamic={args.dynamic}"
+          f"  cache_bits={args.cache_bits}  temp={args.temp}", flush=True)
 
     t0 = time.time()
     config = Config.from_directory(args.model)
@@ -52,7 +59,9 @@ def main():
     #   RuntimeError: recurrent_state must be [num_slots, max_history + 1, ...]
     NDT = args.num_draft_tokens if args.num_draft_tokens is not None else 4
     MH = 0 if args.no_mtp else NDT
-    cache = Cache(model, max_num_tokens=args.cache, max_history=MH)
+    from cache_bits import quant_cache_kwargs
+    qkw = quant_cache_kwargs(args.cache_bits)
+    cache = Cache(model, max_num_tokens=args.cache, max_history=MH, **qkw)
     model.load(progressbar=False)
 
     draft_model = draft_cache = None
@@ -61,7 +70,7 @@ def main():
         # MTP component. Mirrors model_init.init() with args.mtp = True.
         draft_config = config
         draft_model = Model.from_config(draft_config, component="mtp")
-        draft_cache = Cache(draft_model, max_num_tokens=args.cache, max_history=MH)
+        draft_cache = Cache(draft_model, max_num_tokens=args.cache, max_history=MH, **qkw)
         draft_model.load(progressbar=False)
         caps = getattr(draft_model, "caps", {})
         print(f"draft caps mtp_draft={caps.get('mtp_draft')}", flush=True)
@@ -81,7 +90,11 @@ def main():
 
     ids = tokenizer.encode(args.prompt, add_bos=True)
     job_kw = {}
-    if args.greedy:
+    if args.temp is not None:
+        # 0 -> ArgmaxSampler (greedy); >0 -> temperature sampling
+        from exllamav3.generator.sampler import CategoricalSampler
+        job_kw["sampler"] = CategoricalSampler(args.temp)
+    elif args.greedy:
         from exllamav3.generator.sampler import GreedySampler
         job_kw["sampler"] = GreedySampler()
     t0 = time.time()
