@@ -78,7 +78,7 @@ GEMV instead of reconstructing every token.
 
 | Fixture | Device | All-reconstruct | Direct GEMV | |
 | --- | --- | ---: | ---: | ---: |
-| Qwen3.5-9B-Ora, 128 tok | gfx1201 | 16.88 tok/s | 58.2 tok/s | 3.45x |
+| Qwen3.5-9B-Ora, 128 tok | gfx1201 | 16.88 tok/s | 76.8 tok/s | 4.55x |
 | Qwen3.5-9B-Ora, 64 tok | gfx1151 | 5.09 tok/s | 37.4 tok/s | 7.35x |
 
 gfx11.5-only kernels (`exl3_dec`, `qdec.hip`, `gr_mix`) stay pinned to family 2 and

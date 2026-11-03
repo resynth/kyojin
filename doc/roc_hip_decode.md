@@ -17,7 +17,11 @@ The runtime gate in `exllamav3.modules.quant.exl3.LinearEXL3` sends a layer to H
   (K3/mul1, K4/mcg or mul1, K5/mul1, K6/mcg or mul1); all other combinations
   retain the `rows <= 8` limit and fall back above it.
 
-On those gfx12 devices, the real EXL3 decode kernel uses `v_wmma_f32_16x16x16_f16` with fp32 accumulation. That is the supported ROCm acceleration path here; it is not a general matrix fused multiply-add (MFMA) backend.
+On those gfx12 devices, `m == 1` now uses the RDNA fdot2 dot core
+(`rocm/quant/exl3_gemv_rdna.cu`): one warp per 16-wide output tile, decoded
+through `V_DOT2_F32_F16`, with the hand-laid tiles decoder. Rows 2..16 keep the
+`v_wmma_f32_16x16x16_f16` kernel with fp32 accumulation; that is still the only
+WMMA path here, not a general matrix fused multiply-add (MFMA) backend.
 
 ## What falls back
 
@@ -37,13 +41,13 @@ The rest of the ROCm shims in `ext_fallbacks.py` follow the same rule: they pres
 
 HIP does not use the CUDA cooperative-grid decode path.
 
-Instead it runs three stream-ordered launches:
-
-1. input Hadamard
-2. ordinary GEMV
-3. output Hadamard
-
-The earlier cooperative-launch experiment was removed after the Heterogeneous System Architecture (HSA) runtime crashed during shutdown. CUDA keeps its separate cooperative path with `grid.sync()`.
+Rows 2..16 run three stream-ordered launches: input Hadamard, WMMA GEMV, output
+Hadamard. For `m == 1` on gfx1200/gfx1201 the middle launch is the RDNA fdot2
+dot core and the output Hadamard is fused into its store when
+`out_features / 128 <= 1024`; the 248,320-wide lm_head keeps the separate output
+launch. The earlier cooperative-launch experiment was removed after the
+Heterogeneous System Architecture (HSA) runtime crashed during shutdown. CUDA
+keeps its separate cooperative path with `grid.sync()`.
 
 ## Why LDS staging is mandatory on gfx12
 
@@ -106,29 +110,31 @@ The Qwen3.5-9B Ora oracle (all dense projections through the GEMV) reports:
   `reconstruct`/`reconstruct_slice`, i.e. ~207 GEMV launches per token; before the
   expansion the same run made ~6,100 reconstruct calls
 - 16 steps: top-1 16/16, top-5 minimum overlap 4/5, max absolute logit delta
-  0.039063, worst-step mean 0.006269, overall mean 0.003372;
+  0.058594, worst-step mean 0.008850, overall mean 0.003390;
   route proof `gemv=3413, reconstruct=0, reconstruct_slice=0`
-- 128 steps: top-1 128/128 on both gfx1201 and gfx1151. Raw logit deltas grow with
-  the trace (max 10.25 / 9.05, worst-step mean 1.204 / 1.139) because the hybrid GDN
-  recurrence feeds the numerically different linears back into its cache state; the
-  same growth appears on gfx11.5, so it is the fixture rather than the gfx12 path.
-  The forced-token top-1 identity is the hard signal; the tight numeric bounds stay on
+- 128 steps: top-1 128/128 on gfx1201 with max delta 8.113281, worst-step mean
+  1.214331, overall mean 0.060761 (and 128/128 on gfx1151, whose route is still
+  WMMA). Raw logit deltas grow with the trace because the hybrid GDN recurrence
+  feeds the numerically different linears back into its cache state; the same
+  growth appears on gfx11.5, so it is the fixture rather than the gfx12 path. The
+  forced-token top-1 identity is the hard signal; the tight numeric bounds stay on
   the 16-step arm.
 
 Warmed decode on the same pack and prompt, three trials after warmup:
 
 | Device | All-reconstruct baseline | Plain-codebook GEMV | Uplift |
 | --- | ---: | ---: | ---: |
-| gfx1201 (RX 9070), 128 tokens | 16.88 tok/s | 58.2 tok/s | 3.45x |
+| gfx1201 (RX 9070), 128 tokens | 16.88 tok/s | 76.8 tok/s | 4.55x |
 | gfx1151 (8060S), 64 tokens | 5.09 tok/s | 37.4 tok/s | 7.35x |
 
 The same pack on upstream exllamav3 v1.6.6 (its `BC_LinearEXL3` HIP path) measured
-89.8 tok/s on the same RX 9070. The remaining gap is per-kernel parallelisation:
-these GEMVs reach 110-155 GB/s on the small dense shapes versus 356 GB/s on the
-K5 vocabulary head, so the 128-CU part is under-occupied at `n <= 12288` (the
-config heuristic was tuned on 20-CU gfx11.5). Closing it needs a new split-K or
-finer-N config, not a different `cfg 0/1` choice; a cfg sweep on the hot shapes was
-within run-to-run drift (<3%).
+89.8 tok/s on the same RX 9070. The RDNA fdot2 port closed the kernel gap: a
+streaming pass over all 201 dense linears takes 10.2-10.3 ms here (260 GB/s),
+versus 10.8 ms for upstream's direct `exl3_gemv` and 9.93 ms for its `exl3_gemm`
+route. The remaining ~1.5 ms/token is host-side: upstream executes whole blocks
+through its C++ `BC_*` graph modules, while this tree still runs the dense Python
+modules eagerly (about 14.6 ms CPU per token against 12.9 ms wall). Closing it
+needs a BC-block port or a graph-safe dense-block path, not another GEMV config.
 
 A cfg sweep was performed with a temporary in-kernel `EXL3_GEMV_CFG` hook because
 `ext.exl3_gemv` passes `force=true` and pins mode 2; the hook was removed before

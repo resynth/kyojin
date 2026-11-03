@@ -128,7 +128,7 @@ python tools/qwen/serve.py --model ./qwen-pack --port 8000 -c 131072
 
 The server speaks the OpenAI API on port 8000. GLM and MiMo commands: [doc/models.md](doc/models.md).
 
-The same ROCm build also supports a standalone **gfx1201 (RX 9070, RDNA 4)**: a 9B plain-codebook EXL3 pack decodes at 58 tok/s on a 16 GB 9070 (16.9 tok/s with the all-reconstruct fallback). Kernel notes and caveats: [doc/roc_hip_decode.md](doc/roc_hip_decode.md); 16 GB packs larger than 9B need the layer split.
+The same ROCm build also supports a standalone **gfx1201 (RX 9070, RDNA 4)**: a 9B plain-codebook EXL3 pack decodes at 77 tok/s on a 16 GB 9070 (16.9 tok/s with the all-reconstruct fallback). Kernel notes and caveats: [doc/roc_hip_decode.md](doc/roc_hip_decode.md); 16 GB packs larger than 9B need the layer split.
 
 ## Read more
 
