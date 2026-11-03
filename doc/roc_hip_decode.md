@@ -200,6 +200,16 @@ This is a foundation result, not the final serving profile. Qwen4Exp currently u
 
 The Qwen3.5-9B fixture exposed an incorrect portable translation of the original PTX `lop3` expression. The fix restores the exact LUT `0x6a` semantics for plain and MCG procedural codebooks. A zero-state reconstruction test now checks the codebook value independently of both GEMV and the reconstruct implementation.
 
+## Narrow skinny GEMM fix
+
+The ROCm `hgemm` skinny path (m <= 32, n <= 128) sized its grid for two adjacent
+columns per lane and then dispatched the one-column padded kernels for m=9..32.
+At n=128 that left columns 64..127 unwritten, and because `reconstruct_hgemm`
+passes an uninitialized output, repeated reconstruct calls differed. `hgemm.cu`
+now restricts the two-column form to `m <= 8`, so rows 9..32 use the matching
+one-column grid. Verified at m=9/n=128 (all 128 columns written) and by the
+MMODE-2/K5 synthetic tests at n=128.
+
 ## Build and test
 
 ```sh
