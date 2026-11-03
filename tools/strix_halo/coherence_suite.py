@@ -54,12 +54,13 @@ def _worst_ngram_repeat(text, n=20):
 
 def _render(tokenizer, prompt):
     """Render the pack's own Jinja chat template (no transformers dependency)."""
-    from jinja2 import Environment, BaseLoader
+    from jinja2 import BaseLoader
+    from jinja2.sandbox import ImmutableSandboxedEnvironment
 
     path = os.path.join(tokenizer.config.directory, "chat_template.jinja")
     if not os.path.isfile(path):
         return prompt
-    env = Environment(loader=BaseLoader(), trim_blocks=True, lstrip_blocks=True)
+    env = ImmutableSandboxedEnvironment(loader=BaseLoader(), trim_blocks=True, lstrip_blocks=True)
     env.globals["raise_exception"] = lambda msg: (_ for _ in ()).throw(ValueError(msg))
     template = env.from_string(open(path, encoding="utf-8").read())
     messages = [{"role": "user", "content": prompt}]
