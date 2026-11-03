@@ -60,14 +60,15 @@ int main() {return !(run<10>() && run<12>() && run<14>() && run<16>());}
     subprocess.run([str(exe)],check=True,env={**os.environ,'ASAN_OPTIONS':'detect_leaks=0'})
 
 
-def helpers():
+def helpers(family=2):
     tree = ast.parse((ROOT / 'exllamav3/modules/quant/exl3.py').read_text())
     nodes = [n for n in tree.body if
              isinstance(n, ast.FunctionDef) and n.name in ('dec_supported','dec_moe_supported') or
              isinstance(n, ast.Assign) and any(isinstance(t,ast.Name) and t.id in
                 ('_DEC_KB2','_DEC_KB2_DENSE','_DENSE_K8_SHAPES') for t in n.targets)]
     ns = {'os':os,'torch':NS(version=NS(hip=True)), 'EXL3_DEC':True,
-          'ext':NS(exl3_dec_gemv=True,exl3_dec_moe=True)}
+          'ext':NS(exl3_dec_gemv=True,exl3_dec_moe=True),
+          '_hip_wmma_family':lambda device: family}
     exec(compile(ast.Module(body=nodes,type_ignores=[]),'eligibility','exec'),ns)
     return ns
 
@@ -75,7 +76,7 @@ def helpers():
 def inner(k=8, shape=(2560,10240)):
     i,o=shape
     return NS(K=k,mul1=True,mcg=False,in_features=i,out_features=o,
-              trellis=NS(shape=(i//16,o//16,128)),suh=1,svh=1)
+              trellis=NS(shape=(i//16,o//16,128),device=NS(index=0)),suh=1,svh=1)
 
 
 class DenseK8Checks(unittest.TestCase):
@@ -106,6 +107,15 @@ class DenseK8Checks(unittest.TestCase):
                 x = inner()
                 setattr(x,attribute,value)
                 self.assertFalse(helpers()['dec_supported'](x))
+
+    def test_requires_wmma_family_2(self):
+        for family in [0, 1]:
+            ns = helpers(family)
+            self.assertFalse(ns['dec_supported'](inner(k=4)))
+            self.assertFalse(ns['dec_moe_supported'](inner(k=4)))
+        ns = helpers(2)
+        self.assertTrue(ns['dec_supported'](inner(k=4)))
+        self.assertTrue(ns['dec_moe_supported'](inner(k=4)))
 
 if __name__ == '__main__':
     unittest.main()
