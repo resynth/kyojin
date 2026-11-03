@@ -515,7 +515,7 @@ class LinearEXL3:
                         and self.in_features % 128 == 0
                         and self.out_features % 128 == 0
                         and 2 <= self.K <= 6
-                        and (self.K == 4 or self.mcg or self.mul1)):
+                        and (float(self.K).is_integer() or self.mul1)):
                     return self.hip_gemv(x, out_dtype)
 
         return self.reconstruct_hgemm(x, out_dtype)
