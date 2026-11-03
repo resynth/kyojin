@@ -359,6 +359,48 @@ def test_hip_gemv_rows_9_to_16_synthetic_route_to_gemv(K, mcg, mul1, rows, out_d
 
 
 @torch.inference_mode()
+def test_hip_gemv_mmode2_narrow_n_matches_matmul():
+    """MMODE-2 at size_n=128 matches an explicit reconstruct + torch.matmul reference.
+
+    LinearEXL3.forward's reconstruct fallback is not a usable oracle here: the skinny
+    hgemm path (m<=32, n<=128) leaves/accumulates C, so its output varies run to run.
+    The GEMV itself is bit-identical to the matmul reference.
+    """
+    from exllamav3.modules.quant.exl3 import LinearEXL3
+
+    _require_gfx12()
+    K = 5
+    size_k = size_n = 128
+    rows = 9
+    torch.manual_seed(9100)
+    trellis = _make_distinct_finite_trellis(K, size_k, size_n)
+    suh = (torch.randint(0, 2, (size_k,), device="cuda") * 2 - 1).to(torch.float16)
+    svh = (torch.randint(0, 2, (size_n,), device="cuda") * 2 - 1).to(torch.float16)
+    mul1 = torch.ones((), dtype=torch.int32, device="cuda")
+    linear = LinearEXL3(None, size_k, size_n, suh=suh, svh=svh, trellis=trellis,
+                        mcg=None, mul1=mul1)
+    try:
+        x = torch.randn((1, rows, size_k), dtype=torch.float16, device="cuda") * 1e-3
+        weight = torch.empty((size_k, size_n), dtype=torch.half, device="cuda")
+        ext.reconstruct(weight, trellis, K, False, True)
+        xh = torch.empty((rows, size_k), dtype=torch.half, device="cuda")
+        ext.had_r_128(x.view(rows, size_k), xh, suh, None, 1.0)
+        expected = (xh.float() @ weight.float()).half()
+        ext.had_r_128(expected, expected, None, svh, 1.0)
+
+        calls, restore = _spy_ext_route()
+        try:
+            actual = linear.forward(x, {"reconstruct": False})
+        finally:
+            restore()
+        assert calls["gemv"] == 1, calls
+        assert calls["reconstruct"] == 0 and calls["hgemm"] == 0, calls
+        torch.testing.assert_close(actual.view(rows, size_n), expected, rtol=0, atol=0.03)
+    finally:
+        linear.unload()
+
+
+@torch.inference_mode()
 def test_hip_gemv_k2_rows_8_routes_to_gemv():
     _require_gfx12()
     actual, expected, calls, x, size_n = _run_rows_synthetic_oracle(2, True, False, 8, torch.float16)
@@ -444,7 +486,9 @@ def _run_rows_synthetic_oracle(K, mcg, mul1, rows, out_dtype=torch.float16):
 
     _require_gfx12()
     torch.manual_seed(7000 + 10 * K + 100 * mcg + 1000 * mul1 + rows)
-    size_k = size_n = 128
+    # n >= 256 keeps the reconstruct oracle away from the skinny hgemm path (m<=32,
+    # n<=128); the n=128 GEMV correctness case uses a torch.matmul reference instead.
+    size_k = size_n = 256
     trellis = _make_distinct_finite_trellis(K, size_k, size_n)
     suh = (torch.randint(0, 2, (size_k,), device="cuda") * 2 - 1).to(torch.float16)
     svh = (torch.randint(0, 2, (size_n,), device="cuda") * 2 - 1).to(torch.float16)
@@ -468,7 +512,7 @@ def _run_rows_synthetic_oracle(K, mcg, mul1, rows, out_dtype=torch.float16):
     return actual, expected, calls, x, size_n
 
 
-@pytest.mark.parametrize("size_n", [128, 8320], ids=["cfg0-exact-tail", "cfg1"])
+@pytest.mark.parametrize("size_n", [256, 8320], ids=["cfg0", "cfg1"])
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
 @pytest.mark.parametrize("out_dtype", [torch.float16, torch.float32], ids=["fp16", "fp32"])
 @torch.inference_mode()
