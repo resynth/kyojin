@@ -66,7 +66,7 @@ def main():
 
     job = Job(
         input_ids=tokenizer.encode(PROMPT, add_bos=True),
-        max_new_tokens=STEPS + 1,
+        max_new_tokens=STEPS,
         stop_conditions=[],
         return_logits=True,
         sampler=GreedySampler(),

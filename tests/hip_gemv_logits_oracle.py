@@ -55,11 +55,16 @@ def main():
         # calls are independently ineligible architecture paths, not EXL3 reconstruction.
         assert gemv_counts["gemv"] >= 5000
         assert gemv_counts["gemv"] >= 2.5 * gemv_counts["hgemm"]
+        # Route proof for this fixture: every eligible tensor must have taken the GEMV.
+        assert gemv_counts["reconstruct"] == 0
+        assert gemv_counts["reconstruct_slice"] == 0
+        assert gemv_counts["reconstruct_had_slice"] == 0
     else:
+        # Other fixtures (e.g. the Qwen3.5-9B OraQuant pack) store no mcg/mul1 codebook, so
+        # only their K==4 tensors are GEMV-eligible and the K in {2,3,5} projections
+        # legitimately reconstruct. The route proof here is that the GEMV ran at all: the
+        # end-to-end logits below still cover those GEMV tensors, so any GEMV error surfaces.
         assert gemv_counts["gemv"] > 0
-    assert gemv_counts["reconstruct"] == 0
-    assert gemv_counts["reconstruct_slice"] == 0
-    assert gemv_counts["reconstruct_had_slice"] == 0
 
     for logits in (fallback_logits, gemv_logits):
         assert not torch.isnan(logits).any()
