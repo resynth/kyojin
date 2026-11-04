@@ -11,7 +11,11 @@ The runtime gate in `exllamav3.modules.quant.exl3.LinearEXL3` sends a layer to H
 - the decode batch is `rows <= 16` for the HIP GEMV route, subject to the existing K/codebook constraints; rows 9..16 are only for the supported native MMODE-2 variants (K3/mul1, K4/mcg or mul1, K5/mul1, K6/mcg or mul1), while K2 and all other codebook variants retain the rows<=8 limit; unsupported combinations fall back;
 - `in_features` and `out_features` are both multiples of 128;
 - `K` is from 2 through 6;
-- the existing codebook flags match the instantiated family (`mcg` / `mul1` when required); K5 and K6 require one of those two codebooks.
+- the codebook flags match an instantiated family: every `K` in 2..6 has the plain
+  procedural codebook (`cb=0`), MCG (`cb=1`) and MUL1 (`cb=2`) variants for
+  `rows <= 8`. The 9..16-row MMODE-2 variants are the native subset only
+  (K3/mul1, K4/mcg or mul1, K5/mul1, K6/mcg or mul1); all other combinations
+  retain the `rows <= 8` limit and fall back above it.
 
 On those gfx12 devices, the real EXL3 decode kernel uses `v_wmma_f32_16x16x16_f16` with fp32 accumulation. That is the supported ROCm acceleration path here; it is not a general matrix fused multiply-add (MFMA) backend.
 
@@ -20,7 +24,8 @@ On those gfx12 devices, the real EXL3 decode kernel uses `v_wmma_f32_16x16x16_f1
 Anything outside the envelope above uses the existing reconstruct path:
 
 - rows `> 16`
-- unsupported bitrate / codebook combinations
+- unsupported bitrate / codebook combinations (K outside 2..6, half-integer
+  bitrates without MUL1, rows 9..16 for a non-MMODE-2 K/codebook pair)
 - `EXL3_GEMV=0`
 - non-gfx12 ROCm devices
 
@@ -67,7 +72,7 @@ Current local verification on gfx1201 includes:
 - 63 grouped K3 MoE route, numerical, multirow, safety, LoRA, and fallback tests, plus opt-in full Flash and MTP oracles
 - 44 native ROCm shared-gate fusion, stream, validation, and fallback tests
 - 25 gfx12 batch-one router numerical, tie, stream, validation, fallback, and real-layer tests
-- forced-identical-context 16-step logits oracles for mul1 and MCG models
+- forced-identical-context 16-step logits oracles for mul1, MCG, and plain-codebook models
 
 The Qwen3.8-27B mul1 oracle reports:
 
@@ -86,7 +91,64 @@ The Qwen3.5-9B MCG oracle reports:
 - worst-step mean delta: 0.017942
 - overall mean delta: 0.009152
 
-Warmed decode measurements on gfx1201:
+## Plain procedural codebook (cb0)
+
+Packs that store no `mcg`/`mul1` tensors (the OraQuant 9B fixture is one) use the plain
+procedural codebook. K2/K3/K5/K6 now have `cb=0` instantiations for the
+`rows <= 8` configs (narrow and wide, fp16 and fp32 output), so their projections no
+longer reconstruct the weight every token. `exl3_gemv_cfg` and
+`exl3_gemv_try_launch` keep the `cb=0` restriction only on the CUDA branch; the
+Python route requires `2 <= K <= 6` and keeps the K/rows/shape checks.
+
+The Qwen3.5-9B Ora oracle (all dense projections through the GEMV) reports:
+
+- route census on a 32-token decode: 6,629 `exl3_gemv` calls and zero
+  `reconstruct`/`reconstruct_slice`, i.e. ~207 GEMV launches per token; before the
+  expansion the same run made ~6,100 reconstruct calls
+- 16 steps: top-1 16/16, top-5 minimum overlap 4/5, max absolute logit delta
+  0.039063, worst-step mean 0.006269, overall mean 0.003372;
+  route proof `gemv=3413, reconstruct=0, reconstruct_slice=0`
+- 128 steps: top-1 128/128 on both gfx1201 and gfx1151. Raw logit deltas grow with
+  the trace (max 10.25 / 9.05, worst-step mean 1.204 / 1.139) because the hybrid GDN
+  recurrence feeds the numerically different linears back into its cache state; the
+  same growth appears on gfx11.5, so it is the fixture rather than the gfx12 path.
+  The forced-token top-1 identity is the hard signal; the tight numeric bounds stay on
+  the 16-step arm.
+
+Warmed decode on the same pack and prompt, three trials after warmup:
+
+| Device | All-reconstruct baseline | Plain-codebook GEMV | Uplift |
+| --- | ---: | ---: | ---: |
+| gfx1201 (RX 9070), 128 tokens | 16.88 tok/s | 58.2 tok/s | 3.45x |
+| gfx1151 (8060S), 64 tokens | 5.09 tok/s | 37.4 tok/s | 7.35x |
+
+The same pack on upstream exllamav3 v1.6.6 (its `BC_LinearEXL3` HIP path) measured
+89.8 tok/s on the same RX 9070. The remaining gap is per-kernel parallelisation:
+these GEMVs reach 110-155 GB/s on the small dense shapes versus 356 GB/s on the
+K5 vocabulary head, so the 128-CU part is under-occupied at `n <= 12288` (the
+config heuristic was tuned on 20-CU gfx11.5). Closing it needs a new split-K or
+finer-N config, not a different `cfg 0/1` choice; a cfg sweep on the hot shapes was
+within run-to-run drift (<3%).
+
+A cfg sweep was performed with a temporary in-kernel `EXL3_GEMV_CFG` hook because
+`ext.exl3_gemv` passes `force=true` and pins mode 2; the hook was removed before
+merge.
+
+Chat-path quality (8 prompts: factual, arithmetic, code, instruction-following,
+long-form; greedy and default sampling; `tools/strix_halo/coherence_suite.py`):
+all 16 runs reached EOS, no loop-guard fire, no 20-gram repeated more than twice.
+The raw-completion loop seen with `load_qwen.py` does not reproduce through the
+chat template; use `tools/qwen/serve.py` (template + stop conditions + loop guard)
+as the supported chat path.
+
+Large-pack coverage was checked from the safetensors headers (neither fits the
+16 GB card, so this is eligibility only, not a run): the 102 GB Qwen3.8-Flash-Next
+pack is mul1 with dense K4/K5/K6 (K8 tensors stay on reconstruct), and the 92 GB
+GLM-5.3 pack is entirely mul1 with K2/K3/K4/K5/K6. Both are covered by the existing
+mul1 instantiations; the plain-codebook expansion changes nothing for them.
+
+Warmed decode measurements on gfx1201 (MCG / mul1 fixtures; these are not the Ora
+plain-codebook pack above and must not be used as its baseline):
 
 | Model | Trial size | K6 reconstruct median | Direct K6 median | Uplift |
 | --- | ---: | ---: | ---: | ---: |
@@ -137,6 +199,16 @@ This is a foundation result, not the final serving profile. Qwen4Exp currently u
 ## MCG compatibility
 
 The Qwen3.5-9B fixture exposed an incorrect portable translation of the original PTX `lop3` expression. The fix restores the exact LUT `0x6a` semantics for plain and MCG procedural codebooks. A zero-state reconstruction test now checks the codebook value independently of both GEMV and the reconstruct implementation.
+
+## Narrow skinny GEMM fix
+
+The ROCm `hgemm` skinny path (m <= 32, n <= 128) sized its grid for two adjacent
+columns per lane and then dispatched the one-column padded kernels for m=9..32.
+At n=128 that left columns 64..127 unwritten, and because `reconstruct_hgemm`
+passes an uninitialized output, repeated reconstruct calls differed. `hgemm.cu`
+now restricts the two-column form to `m <= 8`, so rows 9..32 use the matching
+one-column grid. Verified at m=9/n=128 (all 128 columns written) and by the
+MMODE-2/K5 synthetic tests at n=128.
 
 ## Build and test
 

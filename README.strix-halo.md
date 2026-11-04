@@ -66,7 +66,24 @@ Based on [sdougbrown/exllamav3](https://github.com/sdougbrown/exllamav3) branch 
 
 **Harnesses (`tools/strix_halo/`):** `bench_mtp.py` (end-to-end decode), `gemv_micro.py`
 (per-shape kernel timing vs. roofline), `gemv_by_m.py`, `int8_parity.py`, `moe_layer_prof.py`,
-`split_prof.py`, `roofline.py`, WMMA oracles, and `env.sh` (venv + build-mode SDK env).
+`split_prof.py`, `roofline.py`, `coherence_suite.py` (8-prompt free-run quality gate), WMMA oracles,
+and `env.sh` (venv + build-mode SDK env).
+
+## Standalone gfx1201 (RX 9070)
+
+The extension builds for `PYTORCH_ROCM_ARCH="gfx1201;gfx1151"` in one `.so` and runs
+on a 16 GB RX 9070 as well as the iGPU. Dense packs that store no `mcg`/`mul1`
+tensors use the plain procedural codebook; K2/K3/K5/K6 now take the direct WMMA
+GEMV instead of reconstructing every token.
+
+| Fixture | Device | All-reconstruct | Direct GEMV | |
+| --- | --- | ---: | ---: | ---: |
+| Qwen3.5-9B-Ora, 128 tok | gfx1201 | 16.88 tok/s | 58.2 tok/s | 3.45x |
+| Qwen3.5-9B-Ora, 64 tok | gfx1151 | 5.09 tok/s | 37.4 tok/s | 7.35x |
+
+gfx11.5-only kernels (`exl3_dec`, `qdec.hip`, `gr_mix`) stay pinned to family 2 and
+are not selected on gfx12. Packs larger than the 16 GB card need the layer split.
+Details: [doc/roc_hip_decode.md](doc/roc_hip_decode.md).
 
 ## Results — Qwen3.8-Flash-Next-EXL3 (3.05 bpw), decode
 

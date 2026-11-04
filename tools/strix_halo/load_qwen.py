@@ -1,12 +1,10 @@
 #!/usr/bin/env python
-"""Load the Qwen3.8-Flash-Next EXL3 pack on gfx1151 and generate greedily.
+"""Raw-completion loader benchmark (no chat template, no stop policy).
 
-Correctness-first smoke test: proves the pack loads and produces coherent
-text through exllamav3's own engine on AMD Strix Halo. Speed is secondary --
-gfx1151 falls back to reconstruct+hgemm (exl3_gemv_supported() == False).
-
-The 32.6 GB n-gram/PLE table stays file-backed ("trellis_disk" mode), which
-is what lets an ~80 GB pack fit in 61.4 GiB of GPU-visible memory.
+This is a smoke/throughput harness, not the supported chat path: the prompt is fed as
+raw text, so an instruction-tuned pack can loop. Use tools/qwen/serve.py for chat
+(template + stop conditions + loop guard), or tools/strix_halo/coherence_suite.py for
+the free-run quality gate.
 """
 import argparse, os, sys, time
 

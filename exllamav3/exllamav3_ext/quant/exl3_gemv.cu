@@ -1140,7 +1140,7 @@ void exl3_moe_gfx12_k3_prefill
     // slots vs 514 — so take the smaller of the two; large-A prefill keeps the
     // old bound.
     const int chunk_slots = std::min(
-        CEIL_DIVIDE(assignments, MOE_PREFILL_ROWS_PER_CHUNK) + experts, assignments);
+        CEIL_DIVIDE(assignments, MOE_PREFILL_ROWS_PER_CHUNK) + (int) experts, assignments);
     const int pcfg = moe_prefill_cfg();
     const int pcols = pcfg == 0 ? 32 : 64;          // COLS = WNT * 16 in exl3_gemv_kernel_body
     dim3 gu_grid(intermediate / pcols, chunk_slots, 2);
@@ -1276,7 +1276,9 @@ static int exl3_gemv_cfg(int cc, int size_m, int size_k, int size_n, int K, int 
 #else
     if (K < 2 || K > 4) return -1;
 #endif
+#if !defined(USE_ROCM)
     if (K != 4 && cb == 0) return -1;
+#endif
 #if defined(USE_ROCM)
     // K2 has no HIP MMODE-2 instantiation; its established envelope ends at eight rows.
     if (K == 2 && size_m > EXL3_GEMV_MAX_M) return -1;
@@ -1324,6 +1326,10 @@ static void* exl3_gemv_select_kernel(int bits, int cb, bool c_fp32, int mmode, i
         SEL(bits_, cb_, false, 2, 0) SEL(bits_, cb_, false, 2, 1) \
         SEL(bits_, cb_, true,  2, 0) SEL(bits_, cb_, true,  2, 1)
     SEL_GRID(4, 0) SEL_GRID(4, 1) SEL_GRID(4, 2)
+    // Plain procedural codebook (cb 0) is common in EXL3 packs that store no mcg/mul1
+    // tensors. Only the m=1..8 configs are instantiated (no MMODE 2), matching the
+    // HIP route envelope in modules/quant/exl3.py.
+    SEL_GRID(2, 0) SEL_GRID(3, 0) SEL_GRID(5, 0) SEL_GRID(6, 0)
     SEL_GRID(2, 1) SEL_GRID(2, 2)
     SEL_GRID(3, 1) SEL_GRID(3, 2)
     SEL_GRID(5, 1) SEL_GRID(5, 2)
@@ -1413,7 +1419,9 @@ bool exl3_gemv_try_launch
 #else
         if (K < 2 || K > 4) return false;
 #endif
+#if !defined(USE_ROCM)
         if (K != 4 && cb == 0) return false;
+#endif
     }
 #if defined(USE_ROCM)
     // Integer K2 has no HIP MMODE-2 instantiation; fractional kernels do.
