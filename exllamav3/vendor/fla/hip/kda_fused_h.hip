@@ -1,9 +1,8 @@
 // KDA fused chunk recurrence (o fused), hand-written for gfx11.5 / gfx12 WMMA (wave32).
 // Same math and the same rounding points as chunk_kda_fwd_kernel_h_fused (FUSE_O) in kda_fused_h.py,
-// so o and the final state match it bitwise on gfx11.5: bf16 x bf16 products truncated, casts RNE, raw v_exp_f32,
-// fp32 WMMA accumulation chained in the same k order, no fma contraction (build with -ffp-contract=off).
-// The gfx12 path uses the same math but is not bitwise (the gfx12 bf16 WMMA fp32 accumulation order differs
-// from Triton's lowering: ~4e-3 relL2 on o and the final state); it stays runtime-gated off.
+// so o and the final state match it bitwise on gfx11.5 and gfx12: bf16 products round RNE, casts RNE,
+// raw v_exp_f32, fp32 WMMA accumulation chained in the same k order, no fma contraction (build with
+// -ffp-contract=off). The gfx12 fragment path uses 8 bf16 per lane and direct C->B packing.
 //
 // One workgroup (8 waves) per (batch, value head); K = V = 128, BT = 64. Wave i owns the state columns
 // h[:, 16i:16i+16] in registers (8 WMMA C tiles) and computes w[:, 16i:16i+16] and u[:, 16i:16i+16].
@@ -115,9 +114,10 @@ __device__ __forceinline__ uint32_t f2bf(float f)
 }
 __device__ __forceinline__ float bf2f(uint32_t b) { return __uint_as_float(b << 16); }
 __device__ __forceinline__ float rbf(float f) { return bf2f(f2bf(f)); }
-// Triton rounds explicit .to(bf16) casts to nearest even but truncates the result of bf16 x bf16 arithmetic
-// (k * beta, v * beta); oracle-checked against the Triton kernel on a captured GLM chunk.
-__device__ __forceinline__ uint32_t f2bf_rtz(float f) { return __float_as_uint(f) >> 16; }
+// Triton rounds explicit .to(bf16) casts and its bf16 x bf16 arithmetic (k * beta, v * beta)
+// to nearest even on both gfx11.5 and gfx12 under Triton 3.9 (oracle-checked on the box).
+// Keep the multiply site named so an arch-specific rounding can be reintroduced if needed.
+__device__ __forceinline__ uint32_t f2bf_mul(float f) { return f2bf(f); }
 __device__ __forceinline__ float ex2(float x) { return __builtin_amdgcn_exp2f(x); }
 
 __device__ __forceinline__ v8f wmma(frag_ab_t a, frag_ab_t b, v8f c)
@@ -378,10 +378,10 @@ extern "C" __global__ __launch_bounds__(PFW ? 288 : 256) void kda_fused_h_o(
                     const float fb = bf2f(bb), eg0 = ex2(g.x), eg1 = ex2(g.y);
                     const float k0 = bf2f(kk & 0xffff), k1 = bf2f(kk >> 16);
                     const float q0 = bf2f(qq & 0xffff), q1 = bf2f(qq >> 16);
-                    kb[0][e] = f2bf(bf2f(f2bf_rtz(k0 * fb)) * eg0);
-                    kb[1][e] = f2bf(bf2f(f2bf_rtz(k1 * fb)) * eg1);
-                    vb[0][e] = f2bf_rtz(bf2f(vv & 0xffff) * fb);
-                    vb[1][e] = f2bf_rtz(bf2f(vv >> 16) * fb);
+                    kb[0][e] = f2bf(bf2f(f2bf_mul(k0 * fb)) * eg0);
+                    kb[1][e] = f2bf(bf2f(f2bf_mul(k1 * fb)) * eg1);
+                    vb[0][e] = f2bf_mul(bf2f(vv & 0xffff) * fb);
+                    vb[1][e] = f2bf_mul(bf2f(vv >> 16) * fb);
                     kg[0][e] = f2bf(k0 * (ok ? ex2(gn.x - g.x) : 0.0f));
                     kg[1][e] = f2bf(k1 * (ok ? ex2(gn.y - g.y) : 0.0f));
                     qgp[s] = f2bf(q0 * eg0) | (f2bf(q1 * eg1) << 16);
@@ -442,10 +442,10 @@ extern "C" __global__ __launch_bounds__(PFW ? 288 : 256) void kda_fused_h_o(
                 const float fb = bf2f(bb), eg0 = ex2(g.x), eg1 = ex2(g.y);
                 const float k0 = bf2f(kk & 0xffff), k1 = bf2f(kk >> 16);
                 const float q0 = bf2f(qq & 0xffff), q1 = bf2f(qq >> 16);
-                kb[0][e] = f2bf(bf2f(f2bf_rtz(k0 * fb)) * eg0);
-                kb[1][e] = f2bf(bf2f(f2bf_rtz(k1 * fb)) * eg1);
-                vb[0][e] = f2bf_rtz(bf2f(vv & 0xffff) * fb);
-                vb[1][e] = f2bf_rtz(bf2f(vv >> 16) * fb);
+                kb[0][e] = f2bf(bf2f(f2bf_mul(k0 * fb)) * eg0);
+                kb[1][e] = f2bf(bf2f(f2bf_mul(k1 * fb)) * eg1);
+                vb[0][e] = f2bf_mul(bf2f(vv & 0xffff) * fb);
+                vb[1][e] = f2bf_mul(bf2f(vv >> 16) * fb);
                 kg[0][e] = f2bf(k0 * (ok ? ex2(gn.x - g.x) : 0.0f));
                 kg[1][e] = f2bf(k1 * (ok ? ex2(gn.y - g.y) : 0.0f));
                 qgp[2 * s2 + e] = f2bf(q0 * eg0) | (f2bf(q1 * eg1) << 16);

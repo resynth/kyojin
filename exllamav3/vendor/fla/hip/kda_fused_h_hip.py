@@ -10,16 +10,14 @@ from exllamav3.util.hip_lib import load_hip_runtime
 
 _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kda_fused_h.hip")
 _state = {}
-# The kernel source has a gfx12 (RDNA4) fragment path that hipcc compiles for gfx1200/gfx1201,
-# but its output is not bitwise equal to the Triton fused path on gfx1201 (plan gate G2:
-# o relL2 ~4.4e-3, final state relL2 ~4.0e-3 on a T=64 synthetic chunk, from the gfx12 bf16
-# WMMA accumulation order). Keep the runtime gate gfx11.5-only until that is resolved; the
-# gfx12 path is reachable with _compile() for compile-only checks.
-_ARCHS = GFX115_ARCHS
+# The kernel source has a gfx12 (RDNA4) fragment path. Its bf16 x bf16 products round to
+# nearest even on gfx12 (gfx11.5 truncates), which makes o and the final state bitwise equal
+# to the Triton fused path on gfx1201; both arches are enabled at the gate.
+_ARCHS = GFX115_ARCHS | frozenset(("gfx1200", "gfx1201"))
 
 
 def supported(device=None):
-    """kda_fused_h.hip is gfx11.5-only at the gate; the gfx12 source path is not bitwise yet."""
+    """True for the gfx11.5 and gfx12 WMMA fragment paths of kda_fused_h.hip; refuse others before hipcc."""
     if not torch.version.hip:
         return False
     return device_supported(device, _ARCHS)

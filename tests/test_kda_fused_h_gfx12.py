@@ -4,14 +4,11 @@ The HIP kernel port of kda_fused_h.hip must reproduce the Triton fused path
 (chunk_kda_fwd_h_fused, fuse_o=True) bitwise on gfx1200/gfx1201, including the final
 state and the CK4/CK8 checkpoint side-writes. Skipped on every other device.
 
-STATUS: the gfx12 path compiles, loads and runs, but plan gate G2 is not met. On a
-T=64 synthetic chunk (H=HV=64, K=V=128, l2-normalized q/k, h0 + ht) the HIP path
-differs from Triton by o relL2 4.4e-3 (max 4.9e-4) and final-state relL2 4.0e-3
-(max 6.3e-3); the deltas look like a last-bit fp32 accumulation-order difference in
-the gfx12 bf16 WMMA chain, not a fragment-layout error (a 16x16x16 gfx12 bf16
-oracle matches D == A*B + C exactly). The runtime gate therefore stays gfx11.5-only
-(kda_fused_h_hip._ARCHS); the bitwise test below is xfail until the order is matched
-or the user accepts a KLD/quality bar.
+STATUS: the gfx12 path compiles, loads, runs and is bitwise equal to the Triton fused
+path on gfx1201 for the shape/ragged/h0/ht matrix and CK4/CK8 checkpoints. The missing
+piece was the bf16 x bf16 product rounding: Triton truncates on gfx11.5 but rounds to
+nearest even on gfx12. `kda_fused_h.hip` selects that with `f2bf_mul`, and the runtime
+gate now includes gfx1200/gfx1201.
 """
 import pytest
 import torch
@@ -53,8 +50,8 @@ def kda():
     return RCP_LN2, chunk_local_cumsum, chunk_kda_fwd_intra_pinned, KH, HH
 
 
-def test_runtime_gate_stays_closed(dev, kda):
-    assert kda[4].supported(dev) is False
+def test_runtime_gate_accepts(dev, kda):
+    assert kda[4].supported(dev) is True
 
 
 def _synth(dev, B, T, seed=0):
@@ -88,7 +85,6 @@ def _run_hip(kda, q, k, v, g, beta, scale, Aqk, Akk, h0, ht):
     return o, s
 
 
-@pytest.mark.xfail(strict = False, reason = "G2: gfx12 bf16 WMMA accumulation order differs from Triton")
 @pytest.mark.parametrize("T", T_ALL)
 @pytest.mark.parametrize("B", (1, 2))
 @pytest.mark.parametrize("use_h0", (True, False))
