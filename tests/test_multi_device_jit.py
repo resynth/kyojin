@@ -4,8 +4,9 @@ The engine can run the same kernel on two GPUs from one process. A loader that a
 device 0's arch or keeps one handle per defines string runs the wrong code object on the
 other card. The CDC tests below fake the compiler and the HIP runtime, so the state-key
 and arch-selection invariant is checked without a GPU; the hardware tests load every
-loader on both devices. gdn_hf, gdn_fused, kda_fused and kda_hf are gfx11.5-only: on
-gfx1201 their supported() gate must refuse before any hipcc attempt.
+loader on both devices. gdn_hf, gdn_fused, kda_fused and kda_hf are gfx11.5-only at the
+gate: on gfx1201 their supported() gate must refuse before any hipcc attempt. (The
+kda_fused source has a gfx12 path, but it is not bitwise yet and stays gated off.)
 """
 import ctypes
 import importlib
