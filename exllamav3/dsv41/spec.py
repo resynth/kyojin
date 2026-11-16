@@ -46,6 +46,9 @@ class PortSpec:
         if model.mtp is None:
             raise ValueError("the model has no DSpark stages (num_nextn_predict_layers / dspark_block_size = 0)")
         self.model, self.max_seq = model, max_seq
+        # with the layer split the DSpark stages sit on their own device (the endcap device): every target
+        # hidden that reaches the drafter hops there once, here.
+        self.draft_device = torch.device(getattr(model, "_draft_device", model.device))
         self.st = None
         self.length = 0
         self.spans = None                   # vision.ImageSpan list for the next prefill (set by the engine)
@@ -107,7 +110,7 @@ class PortTarget:
         s.st, s.length, s.block, s.keys_run = pf.st, len(tokens), None, list(keys)
         s.keys = None
         s.cached, s.miss_lcp = pf.cached, pf.lcp
-        s.rows = pf.hidden.to(s.model.device) if pf.hidden is not None else None
+        s.rows = pf.hidden.to(self.draft_device) if pf.hidden is not None else None
         s.drafter._next = len(tokens) - (s.rows.size(0) if s.rows is not None else 0)
         return BlockOut(logits=pf.logits, hidden=s.rows)
 
@@ -122,8 +125,8 @@ class PortTarget:
         logits, hidden = s.model.forward_block(ids, start_pos, s.st)
         s.length, s.block = start_pos + n, (start_pos, n)
         if s.rows is not None:
-            s.rows = torch.cat([s.rows, hidden[0]], dim=0)[-s.model.cfg.sliding_window:]
-        return BlockOut(logits=logits[0], hidden=hidden[0])
+            s.rows = torch.cat([s.rows, hidden[0].to(self.draft_device)], dim=0)[-s.model.cfg.sliding_window:]
+        return BlockOut(logits=logits[0], hidden=hidden[0].to(self.draft_device))
 
     def truncate(self, length: int) -> None:
         s = self.s

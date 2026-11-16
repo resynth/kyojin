@@ -16,8 +16,11 @@ from .linear import DenseLin
 
 
 class DSparkHeads:
-    def __init__(self, m):
-        cfg, s, dt, dv = m.cfg, m.src, m.dtype, m.device
+    def __init__(self, m, device=None):
+        # The stages share endcap device with embed/norm/head (they read m.head / m.embed_w); with the layer
+        # split off m.device is the one device anyway.
+        cfg, s, dt, dv = m.cfg, m.src, m.dtype, (m.device if device is None else torch.device(device))
+        self.dev = dv
         self.m = m
         n = cfg.num_hidden_layers
         self.n_stages = cfg.n_mtp_layers
@@ -61,7 +64,7 @@ class DSparkHeads:
         m, cfg, w = self.m, self.m.cfg, self.m.lw[l]
         B, S, _ = main_x.shape
         win, rd, H, hd = cfg.sliding_window, cfg.qk_rope_head_dim, cfg.num_attention_heads, cfg.head_dim
-        fc_t = m._rope_for(0, st.max_seq)
+        fc_t = m._rope_for(0, st.max_seq, self.dev)
         ring = st.win[l]
         mkv = ops.rmsnorm(w.wkv(main_x), w.kv_norm, cfg.rms_norm_eps)
         ops.rope_apply_(mkv[..., -rd:], fc_t[start_pos:start_pos + S])
@@ -137,7 +140,7 @@ class DSparkHeads:
         n, win, rd = cfg.num_hidden_layers, cfg.sliding_window, cfg.qk_rope_head_dim
         B, S, _ = main_hidden.shape
         main_x = ops.rmsnorm(self.main_proj(main_hidden), self.main_norm, cfg.rms_norm_eps)
-        fc = m._rope_for(0, st.max_seq)[start_pos:start_pos + S]
+        fc = m._rope_for(0, st.max_seq, main_x.device)[start_pos:start_pos + S]
         keep = min(S, win)                                    # position p lives in slot p % win; older rows are overwritten
         slots = torch.tensor([(start_pos + i) % win for i in range(S - keep, S)], device=main_x.device)
         for j in range(self.n_stages):
@@ -153,7 +156,7 @@ class DSparkHeads:
         Prefill returns None (only seeds the rings); decode returns (output_ids [B,blk+1], logits, confidence)."""
         m, cfg = self.m, self.m.cfg
         n = cfg.num_hidden_layers
-        input_ids = input_ids.to(m.device)
+        input_ids = input_ids.to(self.dev)
         main_x = ops.rmsnorm(self.main_proj(main_hidden), self.main_norm, cfg.rms_norm_eps)
         blk = cfg.dspark_block_size
         draft = input_ids.new_full([input_ids.size(0), blk], cfg.dspark_noise_token_id)
@@ -162,8 +165,9 @@ class DSparkHeads:
         h = x.unsqueeze(2).repeat(1, 1, cfg.hc_mult, 1)
         pre_mix = h.new_zeros(h.size(0), h.size(1), cfg.hc_mult, dtype=torch.float32)
         pre_mix[:, :, 0] = 1.0
-        if taps is None and start_pos > 0 and getattr(getattr(m, "hc", None), "name", "") == "hip":
-            S = m.hc.new(h.float())
+        hc_dspark = m.hc_for(h.device) if hasattr(m, "hc_for") else m.hc
+        if taps is None and start_pos > 0 and getattr(hc_dspark, "name", "") == "hip":
+            S = hc_dspark.new(h.float())
             for j in range(self.n_stages):
                 pre_mix = self._block_hip(n + j, S, pre_mix, start_pos, main_x, st)
             h = S.apply().view(h.shape)

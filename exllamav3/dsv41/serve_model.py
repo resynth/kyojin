@@ -32,7 +32,7 @@ from .vision import span_mask, splice
 from . import dec2
 from .serve_ops import make_hc, Router
 from .linear import DenseLin
-from .serve_ops import HipDense
+from .serve_ops import HipDense, TorchHC, probe_hip
 from .serve_moe import LoopMoE, GroupedMoE
 
 
@@ -45,10 +45,15 @@ class DSV41Serving(DSV41Model):
     def __init__(self, cfg: DSV41Config, source, provider=None, engram_store=None, token_map=None, multipliers=None,
                  primes=None, dtype=torch.float16, device="cpu", moe_backends: dict = None, hc=None,
                  prefill_chunk: int = 2048, attn_block: int = 128, index_block_bytes: int = 256 << 20,
-                 engram_prefetch: bool = True, ablit_dir: str = None):
+                 engram_prefetch: bool = True, ablit_dir: str = None, placement=None):
         from .model import DSV41Graph
         DSV41Graph.__init__(self, cfg.validate(), dtype, device)
         self.src = source
+        # Contiguous layer split (dsv41.placement): placement None = split off, single device, and every
+        # attribute below keeps the exact single-device shape it always had.
+        self.placement = placement
+        self.bridge = getattr(placement, "bridge", None) if placement is not None else None
+        self._draft_device = placement.draft_device if placement is not None else self.device
         # row reads overlap with compute: the rows of a pass are known at its start (PrefetchRowStore)
         if engram_store is not None and engram_prefetch and not isinstance(engram_store, (MemoryEngramStore, PrefetchRowStore)):
             engram_store = PrefetchRowStore(engram_store)
@@ -66,11 +71,12 @@ class DSV41Serving(DSV41Model):
                                                     cfg.engram_n_heads, cfg.engram_head_dim, primes)
         self.prefill_chunk, self.attn_block, self.index_block_bytes = prefill_chunk, attn_block, index_block_bytes
         d, dt = self.device, dtype
-        self.embed_w = source.tensor("embed", dt, d)
-        self.norm_w = source.tensor("norm", torch.float32, d)
-        self.head = source.linear("head", dt, d)
+        d_end = self.endcap_device()
+        self.embed_w = source.tensor("embed", dt, d_end)
+        self.norm_w = source.tensor("norm", torch.float32, d_end)
+        self.head = source.linear("head", dt, d_end)
         self.head_w = None
-        self._idx_hip = None
+        self._idx_hips = {}                            # str(device) -> dsv41_idx module or False
         # row block sizes of the prompt-chunk passes (a long chunk keeps its big per-row buffers off the GPU: 0 = whole chunk)
         ev = lambda k, d: int(os.environ.get(k, d)) or (1 << 30)
         self.pf_attn_rows = ev("DSV41_PF_ATTN_ROWS", 8192)      # q [rows, 64 * 512] + attention output
@@ -78,18 +84,45 @@ class DSV41Serving(DSV41Model):
         self.pf_moe_rows = ev("DSV41_PF_MOE_ROWS", 8192)        # MoE combine buffers, shared expert
         self.idx_score_bytes = ev("DSV41_PF_IDX_SCORE_MB", 1024) << 20 if os.environ.get("DSV41_PF_IDX_SCORE_MB", "1024") != "0" else 1 << 62
         self.packed_idx = os.environ.get("DSV41_IDX_PACKED", "0") == "1"
+        # ---- per-device capability objects. One entry per participating device; with the split off the
+        # dicts hold only the home device and the helpers collapse to the original single attributes.
+        self._devices = self._devices_used()
+        self._fast, self._hcs, self._routers = {}, {}, {}
+        for dv in self._devices:
+            fast = self._fast_attn_available(cfg, dtype, dv)
+            hc_dev = make_hc(cfg, dt, dv)
+            use_hip = None                           # split off: the router decides from hip_available, as before
+            if fast and placement is not None:
+                if os.environ.get("DSV41_SPLIT_HIP", "1") == "0" or not probe_hip(dv):
+                    print(f"[split] ds41 HIP kernels unusable on {dv}: torch path on this device", flush=True)
+                    fast = False
+                    hc_dev = TorchHC(cfg, dt)        # the probe vets the whole kernel chain on a split device
+            if placement is not None and not fast:
+                use_hip = False                      # a split device without (probed) kernels: torch router
+            self._fast[str(dv)] = fast
+            self._hcs[str(dv)] = hc if (hc is not None and placement is None) else hc_dev
+            self._routers[str(dv)] = Router(cfg, dv, use_hip=use_hip)
+        self.fast_attn = self._fast[str(self.device)]
+        self.hc = self._hcs[str(self.device)]
+        self.router = self._routers[str(self.device)]
         self.lw = {}
         for l in range(n + cfg.n_mtp_layers):
             self.lw[l] = self._load_layer(l)
         self._rope = {}
         self._rope32 = {}
-        self._pos32 = self._slot32 = None
-        self.fast_attn = self._fast_attn_available(cfg, dtype, device)
-        self.hc = hc or make_hc(cfg, dt, d)
-        self.router = Router(cfg, d)
+        self._pos32 = {}
+        self._slot32 = {}
         counts = {l: cfg.moe_counts(l)[0] for l in range(n + cfg.n_mtp_layers)}
-        self.provider = provider or SourceExpertProvider(source, counts, cache=True, dtype=dt, device=d)
-        self.loop_moe = LoopMoE(self.provider, cfg)
+        if placement is not None:
+            self._providers, self._loop_moes = {}, {}
+            for dv in self._devices:
+                p = SourceExpertProvider(source, counts, cache=True, dtype=dt, device=dv)
+                self._providers[str(dv)], self._loop_moes[str(dv)] = p, LoopMoE(p, cfg)
+            self.provider = self._providers[str(self.device)]
+            self.loop_moe = self._loop_moes[str(self.device)]
+        else:
+            self.provider = provider or SourceExpertProvider(source, counts, cache=True, dtype=dt, device=d)
+            self.loop_moe = LoopMoE(self.provider, cfg)
         self.moe_backends = dict(moe_backends or {})
         self._warm_decode_tables()
         self.fuse = True                      # decode glue fusion (dsv41_fuse); env DSV41_FUSE=0 turns the kernels off
@@ -98,8 +131,77 @@ class DSV41Serving(DSV41Model):
         self.mtp = None
         if cfg.n_mtp_layers:
             from .dspark import DSparkHeads
-            self.mtp = DSparkHeads(self)
+            self.mtp = DSparkHeads(self, device=self._draft_device)
         self.set_ablit(ablit_dir)             # EXL3_ABLIT_RUNTIME / <ablit_dir>/uncensor_spec.json; None = off
+
+    # ---------------------------------------------------------------- per-device state
+    def _devices_used(self) -> list[torch.device]:
+        """Every device the model touches (endcaps / MTP / a front layer may each add one)."""
+        if self.placement is None:
+            return [self.device]
+        seen, out = set(), []
+        for dv in [self.device, self.placement.endcap_device] + self.placement.devices_used():
+            dv = torch.device(dv)
+            if dv not in seen:
+                seen.add(dv)
+                out.append(dv)
+        return out
+
+    def endcap_device(self) -> torch.device:
+        return self.placement.endcap_device if self.placement is not None else self.device
+
+    def text_device(self, l: int) -> torch.device:
+        return self.placement.text_device(l) if self.placement is not None else self.device
+
+    def _dk(self, dev) -> str:
+        return str(torch.device(dev))
+
+    def fast_attn_for(self, dev) -> bool:
+        return self._fast.get(self._dk(dev), self.fast_attn)
+
+    def hc_for(self, dev):
+        return self._hcs.get(self._dk(dev), self.hc)
+
+    def router_for(self, dev) -> Router:
+        return self._routers.get(self._dk(dev), self.router)
+
+    def loop_moe_for(self, dev) -> LoopMoE:
+        return self._loop_moes.get(self._dk(dev), self.loop_moe) if hasattr(self, "_loop_moes") else self.loop_moe
+
+    def provider_for(self, dev) -> SourceExpertProvider:
+        return self._providers.get(self._dk(dev), self.provider) if hasattr(self, "_providers") else self.provider
+
+    def draft_device(self) -> torch.device:
+        return self._draft_device
+
+    def _hop(self, t: torch.Tensor, dst) -> torch.Tensor:
+        """Move `t` to `dst` for a split boundary. The bridge's host-staged hop, chunked once a crossing is
+        big enough that the pinned staging must stay bounded; a plain to() when the bridge is disabled
+        (KYOJIN_BRIDGE=0: util.device_copy forces the safe host bounce). No-op on one device."""
+        dst = torch.device(dst)
+        if t.device == dst:
+            return t
+        if self.bridge is not None:
+            return self.bridge.hop_chunk(t, dst) if t.numel() * t.element_size() >= (1 << 20) else self.bridge.hop(t, dst)
+        from ..util.device_copy import to_device
+        return to_device(t, dst, non_blocking=False)
+
+    def set_ablit(self, model_dir = None):
+        """Per-device species of DSV41Model.set_ablit (split off: the base implementation)."""
+        if self.placement is None:
+            return super().set_ablit(model_dir)
+        from ..modules import ablit_runtime
+        n = self.cfg.num_hidden_layers
+        merged = [None] * n
+        for dv in self._devices:
+            a = ablit_runtime.prepare_dsv41(n, dv, model_dir)
+            if a is None:
+                continue
+            for l in range(n):
+                if a[l] is not None and self.text_device(l) == torch.device(dv):
+                    merged[l] = a[l]
+        self.ablit = merged if any(merged) else None
+        return self.ablit
 
     @staticmethod
     def _fast_attn_available(cfg, dtype, device) -> bool:
@@ -110,20 +212,23 @@ class DSV41Serving(DSV41Model):
                 and cfg.num_attention_heads == 64 and cfg.index_topk <= 1152 - 128 and cfg.index_n_heads == 32
                 and cfg.index_head_dim == 128)
 
-    def _dec_fast(self, B, L, start_pos) -> bool:
-        return self.fast_attn and L == 1 and B == 1 and start_pos > 0 and self._pos32 is not None
+    def _dec_fast(self, l, B, L, start_pos) -> bool:
+        dv = self.text_device(l)
+        return self.fast_attn_for(dv) and L == 1 and B == 1 and start_pos > 0 and self._pos32.get(str(dv)) is not None
 
-    def _geom32(self, start_pos: int, ratio: int):
+    def _geom32(self, start_pos: int, ratio: int, device=None):
         """Device int32 [1] rope position and pool row of the latent completed by decode position start_pos."""
         g0 = start_pos // ratio
-        t = torch.tensor([g0 * ratio, g0], dtype=torch.int32, device=self.device)
+        t = torch.tensor([g0 * ratio, g0], dtype=torch.int32,
+                         device=self.device if device is None else device)
         return t[:1], t[1:]
 
-    def _rope_f32(self, ratio: int, max_seq: int):
-        key = (bool(ratio), max_seq)
+    def _rope_f32(self, ratio: int, max_seq: int, device=None):
+        dv = self.device if device is None else torch.device(device)
+        key = (bool(ratio), max_seq, str(dv))
         if key not in self._rope32:
             from ..modules.dsv41_fn import dsv41_hip as K
-            self._rope32[key] = K.rope_table_f32(self._rope_for(ratio, max_seq))
+            self._rope32[key] = K.rope_table_f32(self._rope_for(ratio, max_seq, dv))
         return self._rope32[key]
 
     # ------------------------------------------------------------------ HIP-graph decode (serve_graph.py)
@@ -146,17 +251,19 @@ class DSV41Serving(DSV41Model):
 
     def _warm_decode_tables(self):
         """Build the decode-step index tensors of every ring phase once, so a decode step never copies host data."""
-        win, dev = self.cfg.sliding_window, self.device
-        if dev.type == "cpu":
-            return
-        for sp in list(range(1, win)) + list(range(win, 2 * win)):
-            ops.window_idxs(win, 1, 1, sp, dev)
-        for ph in range(win):
-            ops.table_memo(("slot", win, ph, str(dev)), lambda ph=ph: torch.tensor([ph], device=dev))
+        win = self.cfg.sliding_window
+        for dev in self._devices:
+            if dev.type == "cpu":
+                continue
+            for sp in list(range(1, win)) + list(range(win, 2 * win)):
+                ops.window_idxs(win, 1, 1, sp, dev)
+            for ph in range(win):
+                ops.table_memo(("slot", win, ph, str(dev)), lambda ph=ph, dev=dev: torch.tensor([ph], device=dev))
 
     # ------------------------------------------------------------------ weights
     def _load_layer(self, l):
-        w = super()._load_layer(l)
+        dv = self.text_device(l)
+        w = super()._load_layer(l, dv)
         f32 = torch.float32
         for nm in ("attn_norm", "ffn_norm", "q_norm", "kv_norm"):
             setattr(w, nm, getattr(w, nm).to(f32))
@@ -164,7 +271,7 @@ class DSV41Serving(DSV41Model):
             w.comp.norm = w.comp.norm.to(f32)
         if w.idx is not None and getattr(w.idx, "owns_k", False):
             w.idx.k_norm = w.idx.k_norm.to(f32)
-        if self._fast_attn_available(self.cfg, self.dtype, self.device):
+        if self.fast_attn_for(dv):
             for lin in (getattr(w.comp, "wkv", None), getattr(w.comp, "wgate", None), getattr(w.idx, "weights_proj", None),
                         getattr(w.idx, "wk", None)):
                 if isinstance(lin, DenseLin):
@@ -195,7 +302,7 @@ class DSV41Serving(DSV41Model):
         cfg, c = self.cfg, self.lw[l].comp
         B, L, _ = x.shape
         r = cfg.ratio(l)
-        fast = self._dec_fast(B, L, start_pos) and st.journal is None
+        fast = self._dec_fast(l, B, L, start_pos) and st.journal is None
         if r == 1:
             if fast:
                 from ..modules.dsv41_fn import dsv41_hip as K
@@ -248,6 +355,15 @@ class DSV41Serving(DSV41Model):
             return None
         return ops.rmsnorm(torch.cat(outs, dim=1).to(dtype), c.norm, cfg.rms_norm_eps)
 
+    def _idx_hip_for(self, dv, dtype, nh, hd):
+        key = str(torch.device(dv))
+        hit = self._idx_hips.get(key)
+        if hit is None:
+            from ..modules.dsv41_fn import dsv41_idx
+            hit = dsv41_idx if (dsv41_idx.available(dv) and dtype == torch.half and nh == 32 and hd == 128) else False
+            self._idx_hips[key] = hit
+        return hit
+
     def _indexer(self, l, x, qr, latent, start_pos, offset, st, rt, fc):
         """Indexer top-k (int32 indices into [window | compressed], offset applied). Same selection as
         DSV41Graph._indexer; the score GEMM runs in query blocks and in fp32."""
@@ -255,16 +371,14 @@ class DSV41Serving(DSV41Model):
         B, L, _ = x.shape
         ratio, rd, end_pos = cfg.ratio(l), cfg.qk_rope_head_dim, start_pos + L
         nh, hd = cfg.index_n_heads, cfg.index_head_dim
-        if B == 1 and self._idx_hip is None:
-            from ..modules.dsv41_fn import dsv41_idx
-            self._idx_hip = dsv41_idx if (dsv41_idx.available(x.device) and x.dtype == torch.half and nh == 32 and hd == 128) else False
-        fast = self._dec_fast(B, L, start_pos) and nh == 32 and hd == 128
+        hip = self._idx_hip_for(x.device, x.dtype, nh, hd)
+        fast = self._dec_fast(l, B, L, start_pos) and nh == 32 and hd == 128
         if fast:
             from ..modules.dsv41_fn import dsv41_hip as K
         if ix.owns_k and fast and not self.packed_idx:
             if latent is not None:
-                ckp, dst = self._geom32(start_pos, ratio)
-                K.idx_k_store(ix.wk(latent).view(1, hd), ix.k_norm, self._rope_f32(ratio, st.max_seq), ckp, dst,
+                ckp, dst = self._geom32(start_pos, ratio, x.device)
+                K.idx_k_store(ix.wk(latent).view(1, hd), ix.k_norm, self._rope_f32(ratio, st.max_seq, x.device), ckp, dst,
                               st.idx_k[l][0], cfg.rms_norm_eps)
             rt.index_k = st.idx_k[l]
         elif ix.owns_k:
@@ -274,8 +388,8 @@ class DSV41Serving(DSV41Model):
                 ops.rope_apply_(k[..., -rd:], ck)
                 quant.fp4_act_quant_(k, 32)
                 st.idx_k[l][:B, row0: row0 + k.size(1)] = k
-                if self._idx_hip and B == 1 and self.packed_idx:
-                    kq, ks = self._idx_hip.pack_keys(k[0])
+                if hip and B == 1 and self.packed_idx:
+                    kq, ks = hip.pack_keys(k[0])
                     st.idx_kq[l][0, row0: row0 + kq.size(0)] = kq
                     st.idx_ks[l][0, row0: row0 + kq.size(0)] = ks
             rt.index_k = st.idx_k[l]
@@ -283,13 +397,13 @@ class DSV41Serving(DSV41Model):
                 rt.index_kq = (st.idx_kq[l], st.idx_ks[l])
         q = ix.wq_b(qr).unflatten(-1, (nh, hd))
         if fast:
-            K.idx_q_prep(q.view(1, nh * hd), self._rope_f32(ratio, st.max_seq), self._pos32, nh)
+            K.idx_q_prep(q.view(1, nh * hd), self._rope_f32(ratio, st.max_seq, x.device), self._pos32[str(x.device)], nh)
         else:
             ops.rope_apply_(q[..., -rd:], fc[start_pos:end_pos])
             quant.fp4_act_quant_(q, 32)
         weights = ix.weights_proj(x).float() * (hd ** -0.5 * nh ** -0.5)
-        if B == 1 and self._idx_hip and rt.index_k.dtype == torch.half:
-            return self._indexer_hip(l, q, weights, start_pos, L, ratio, offset, rt)
+        if B == 1 and hip and rt.index_k.dtype == torch.half:
+            return self._indexer_hip(l, q, weights, start_pos, L, ratio, offset, rt, K=hip)
         index_k = rt.index_k[:B, : end_pos // ratio].float()
         nt = index_k.size(1)
         score = torch.empty(B, L, nt, dtype=torch.float32, device=x.device)
@@ -312,11 +426,12 @@ class DSV41Serving(DSV41Model):
         idxs = score.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values
         return torch.where(idxs < clen, idxs + offset, -1).int()
 
-    def _indexer_hip(self, l, q, weights, start_pos, L, ratio, offset, rt, nt=None):
+    def _indexer_hip(self, l, q, weights, start_pos, L, ratio, offset, rt, nt=None, K=None):
         """Indexer top-k on the WMMA scoring kernels (batch 1). Same selection as the torch path: layers up to and including the
         candidate source scan the whole pool once (fp16 keys, no fp32 copy of the pool); later index sources score only the 16K
         keys of the candidate blocks, so their cost does not grow with the context."""
-        cfg, K = self.cfg, self._idx_hip
+        cfg = self.cfg
+        K = K or self._idx_hip_for(q.device, q.dtype, cfg.index_n_heads, cfg.index_head_dim)
         nh, hd = cfg.index_n_heads, cfg.index_head_dim
         end_pos = start_pos + L
         nt = end_pos // ratio if nt is None else nt
@@ -333,7 +448,7 @@ class DSV41Serving(DSV41Model):
             for a, b in self._row_blocks(L, rows):
                 if cand_l:
                     rt.cand_blocks = whole[a:b]
-                outs.append(self._indexer_hip(l, q2[a:b], w2[a:b], start_pos + a, b - a, ratio, offset, rt, nt=nt))
+                outs.append(self._indexer_hip(l, q2[a:b], w2[a:b], start_pos + a, b - a, ratio, offset, rt, nt=nt, K=K))
                 if l == cs:
                     cands.append(rt.cand_blocks)
             rt.cand_blocks = torch.cat(cands, dim=0) if l == cs else whole
@@ -372,8 +487,9 @@ class DSV41Serving(DSV41Model):
 
     @staticmethod
     def _window_idxs(rt, fn, win, B, L, start_pos, device):
-        """Window slot table of this chunk, built once per pass and shared by every layer (read-only: torch.cat copies it)."""
-        key = (fn.__name__, win, B, L, start_pos)
+        """Window slot table of this chunk, built once per pass and shared by every layer (read-only: torch.cat copies it).
+        Keyed by device too: a split builds one table per side of the boundary."""
+        key = (fn.__name__, win, B, L, start_pos, str(device))
         cache = rt.__dict__.setdefault("widx", {})
         if key not in cache:
             cache[key] = fn(win, B, L, start_pos, device)
@@ -415,9 +531,9 @@ class DSV41Serving(DSV41Model):
         pf = self._pffast(x)
         H, hd, rd, win = cfg.num_attention_heads, cfg.head_dim, cfg.qk_rope_head_dim, cfg.sliding_window
         ratio = cfg.ratio(l)
-        fc_t = self._rope_for(ratio, st.max_seq)
+        fc_t = self._rope_for(ratio, st.max_seq, x.device)
         fc = fc_t[start_pos:start_pos + L]
-        fast = self._dec_fast(B, L, start_pos)
+        fast = self._dec_fast(l, B, L, start_pos)
         ring = st.win[l]
 
         def qpos():
@@ -436,7 +552,8 @@ class DSV41Serving(DSV41Model):
                 kvr = w.wkv(x)
             if st.journal is not None:
                 st._jr_ring(l, [start_pos], B)
-            K.kv_prep(kvr.view(1, hd), w.kv_norm, self._rope_f32(ratio, st.max_seq), self._pos32, self._slot32, None,
+            K.kv_prep(kvr.view(1, hd), w.kv_norm, self._rope_f32(ratio, st.max_seq, x.device),
+                      self._pos32[str(x.device)], self._slot32[str(x.device)], None,
                       ring[0], cfg.rms_norm_eps)
             window_kv = None
         else:
@@ -492,8 +609,8 @@ class DSV41Serving(DSV41Model):
                 if taps is not None:
                     taps[f"L{l}.topk"] = cidx.clone()
             if latent is not None and fast:
-                ckp, dst = self._geom32(start_pos, ratio)
-                K.pool_store(latent.view(1, hd), self._rope_f32(ratio, st.max_seq), ckp, dst, st.comp_kv[cfg.kv_source_of(l)][0])
+                ckp, dst = self._geom32(start_pos, ratio, x.device)
+                K.pool_store(latent.view(1, hd), self._rope_f32(ratio, st.max_seq, x.device), ckp, dst, st.comp_kv[cfg.kv_source_of(l)][0])
             elif latent is not None:
                 ck, row0 = self._latent_geom(start_pos, L, ratio, fc_t)
                 g0 = start_pos // ratio
@@ -513,7 +630,7 @@ class DSV41Serving(DSV41Model):
             nc = cidx.size(-1) if ratio and clen_total else 0
             o = torch.empty(B, L, H * hd, dtype=torch.float16, device=x.device)
             K.attn_dec(q.view(-1), ring[0], rt.compress_kv if nc else None, cidx.view(-1) if nc else None, nc, win + 1,
-                       w.sink, self._rope_f32(ratio, st.max_seq), self._pos32, o.view(-1), sc)
+                       w.sink, self._rope_f32(ratio, st.max_seq, x.device), self._pos32[str(x.device)], o.view(-1), sc)
             o = o.view(B, L, G, -1)
         elif q is None:
             # long prompt chunk: q, the attention output and the grouped output projection run on row blocks (rows are
@@ -586,9 +703,10 @@ class DSV41Serving(DSV41Model):
         cfg, w = self.cfg, self.lw[l]
         shape = x.size()
         x = x.view(-1, cfg.hidden_size)
-        be = self.moe_backends.get(l, self.loop_moe)
+        router = self.router_for(x.device)
+        be = self.moe_backends.get(l, self.loop_moe_for(x.device))
         if (self.fuse and isinstance(be, GroupedMoE) and self._img_rows is None and be.fused_ok(x)
-                and self.router.fused_ok(x, w.gate_w, w.gate_b, w.topk)):
+                and router.fused_ok(x, w.gate_w, w.gate_b, w.topk)):
             sd = dec2.side(x.device) if (x.size(0) == 1 and taps is None) else None
             sh = None
             if sd is not None:
@@ -598,7 +716,7 @@ class DSV41Serving(DSV41Model):
                     x.record_stream(sd.stream)
                     sh = w.shared.ffn(x, None, cfg.swiglu_limit)
                     sd.sh_done.record(sd.stream)
-            wts, wh, idx, gsel = self.router.fused(x, w.gate_w, w.gate_b, w.topk, be.store.lut)
+            wts, wh, idx, gsel = router.fused(x, w.gate_w, w.gate_b, w.topk, be.store.lut)
             if taps is not None:
                 taps[f"L{l}.route.idx"], taps[f"L{l}.route.w"] = idx.clone(), wts.clone()
             be.prepare(idx)
@@ -616,7 +734,7 @@ class DSV41Serving(DSV41Model):
             for o in outs[1:]:
                 y.add_(o)
             return (y + sh.float()).type_as(x).view(shape)
-        wts, idx = self.router(x, w.gate_w, self._route_bias(w), w.topk)
+        wts, idx = router(x, w.gate_w, self._route_bias(w), w.topk)
         if taps is not None:
             taps[f"L{l}.route.idx"], taps[f"L{l}.route.w"] = idx.clone(), wts.clone()
         if isinstance(be, GroupedMoE):
@@ -686,63 +804,101 @@ class DSV41Serving(DSV41Model):
             st.length = max(getattr(st, "length", 0), start_pos + 1)
             return logits, hid
         self._mt(-1, 'hashes')
+        # split segments: front layers on part0, the rest on the home device. Split off (or a boundary that
+        # covers every layer) is one segment and the loop below runs exactly as before.
+        d_end = self.endcap_device()
+        n = cfg.num_hidden_layers
+        if self.placement is not None and 0 < self.placement.part0_layers < n:
+            N0 = self.placement.part0_layers
+            segs = [(0, N0, self.placement.part0), (N0, n, self.device)]
+        elif self.placement is not None and self.placement.part0_layers >= n:
+            segs = [(0, n, self.placement.part0)]     # N covers every layer: the whole trunk lives on part0
+        else:
+            segs = [(0, n, self.device)]
         if img is None and L > self.pf_eng_rows:
             # long chunk: the four streams are filled block by block (no fp32 [L, dim] copy next to the [L, 4, dim] result)
-            h = torch.empty(B, L, cfg.hc_mult, cfg.hidden_size, dtype=torch.float32, device=self.device)
+            h = torch.empty(B, L, cfg.hc_mult, cfg.hidden_size, dtype=torch.float32, device=d_end)
             for a, b in self._row_blocks(L, self.pf_eng_rows):
-                h[:, a:b] = F.embedding(input_ids[:, a:b], self.embed_w).float().unsqueeze(2)
+                h[:, a:b] = F.embedding(input_ids[:, a:b].to(d_end), self.embed_w).float().unsqueeze(2)
         else:
-            h = F.embedding(input_ids, self.embed_w).float()
+            h = F.embedding(input_ids.to(d_end), self.embed_w).float()
             if img is not None:
                 splice(h, start_pos, spans)
                 self._img_rows = img.repeat(B)
             h = h.unsqueeze(2).repeat(1, 1, cfg.hc_mult, 1)
-        S = self.hc.new(h)
+        S = self.hc_for(d_end).new(h)
         pre = h.new_zeros(B, L, cfg.hc_mult)
         pre[:, :, 0] = 1.0
         rt = SharedRt()
         main = []
         self._mt(-1, 'embed+S')
-        if self.fast_attn and L == 1 and B == 1:
-            self._pos32 = torch.tensor([start_pos], dtype=torch.int32, device=self.device)
-            self._slot32 = self._pos32 % cfg.sliding_window
-        for l in range(cfg.num_hidden_layers):
-            w = self.lw[l]
-            tb = self.moe_backends.get(l)
-            if L * B >= 64 and getattr(tb, "tier", None) is not None:
-                tb.tier.store.pf_wrap = ahead_ids is not None and ahead_ids.numel() > 0     # another chunk follows: layer 0 is next after the last layer
-                tb.tier.store.prefill_issue(tb.tier, L * B)     # SSD tier: start the expert reads before this layer's attention
-            if w.engram is not None:
-                e = w.engram
-                S.inject(lambda hh: self._engram_rows(hh, hashes[:, :, e.pos, :], e, keep))
-            if l in cfg.dspark_target_layer_ids and self.mtp is not None:
-                main.append(S.apply().view(B, L, cfg.hc_mult, -1)[:, -(hid_rows or L):].mean(dim=2))     # hid_rows: only the tail is read
-            x = S.cn(pre, w.attn_norm)
-            a_pre, a_post, a_comb = S.mix(w.hc_attn_fn, w.hc_attn_scale, w.hc_attn_base)
-            self._mt(l, 'pre-attn')
-            y = self._attention(l, x, start_pos, st, rt, taps)
-            self._mt(l, 'attn')
-            if self.ablit is not None:
-                y = self._abl(l, 0, y)
-            if taps is not None:
-                taps[f"L{l}.attn"] = y.clone()
-            S.push(y, a_post, a_comb)
-            x = S.cn(a_pre, w.ffn_norm)
-            f_pre, f_post, f_comb = S.mix(w.hc_ffn_fn, w.hc_ffn_scale, w.hc_ffn_base)
-            self._mt(l, 'pre-moe')
-            y = self._moe(l, x, taps)
-            self._mt(l, 'moe')
-            if self.ablit is not None:
-                y = self._abl(l, 1, y)
-            if taps is not None:
-                taps[f"L{l}.ffn"] = y.clone()
-            S.push(y, f_post, f_comb)
-            pre = f_pre
+        if L == 1 and B == 1:
+            for dv in self._devices:
+                if self.fast_attn_for(dv):
+                    pos = torch.tensor([start_pos], dtype=torch.int32, device=dv)
+                    self._pos32[str(dv)] = pos
+                    self._slot32[str(dv)] = pos % cfg.sliding_window
+        s_dev = d_end
+        for l0, l1, seg_dev in segs:
+            if seg_dev != s_dev:
+                # boundary crossing: materialize the hc stream (the delayed pre-mix keeps state that a fresh
+                # device cannot reconstruct), hop h and pre through the bridge, rebuild the stream there.
+                h = self._hop(S.h, seg_dev)
+                S = self.hc_for(seg_dev).new(h)
+                pre = self._hop(pre, seg_dev)
+                s_dev = seg_dev
+            for l in range(l0, l1):
+                w = self.lw[l]
+                tb = self.moe_backends.get(l)
+                if L * B >= 64 and getattr(tb, "tier", None) is not None:
+                    tb.tier.store.pf_wrap = ahead_ids is not None and ahead_ids.numel() > 0     # another chunk follows: layer 0 is next after the last layer
+                    tb.tier.store.prefill_issue(tb.tier, L * B)     # SSD tier: start the expert reads before this layer's attention
+                if w.engram is not None:
+                    e = w.engram
+                    S.inject(lambda hh: self._engram_rows(hh, hashes[:, :, e.pos, :], e, keep))
+                if l in cfg.dspark_target_layer_ids and self.mtp is not None:
+                    # a DSpark tap: rows only (the drafter's device may differ from this layer's)
+                    main.append(self._hop(S.apply().view(B, L, cfg.hc_mult, -1)[:, -(hid_rows or L):].mean(dim=2),
+                                          self._draft_device))     # hid_rows: only the tail is read
+                x = S.cn(pre, w.attn_norm)
+                a_pre, a_post, a_comb = S.mix(w.hc_attn_fn, w.hc_attn_scale, w.hc_attn_base)
+                self._mt(l, 'pre-attn')
+                y = self._attention(l, x, start_pos, st, rt, taps)
+                self._mt(l, 'attn')
+                if self.ablit is not None:
+                    y = self._abl(l, 0, y)
+                if taps is not None:
+                    taps[f"L{l}.attn"] = y.clone()
+                S.push(y, a_post, a_comb)
+                x = S.cn(a_pre, w.ffn_norm)
+                f_pre, f_post, f_comb = S.mix(w.hc_ffn_fn, w.hc_ffn_scale, w.hc_ffn_base)
+                self._mt(l, 'pre-moe')
+                y = self._moe(l, x, taps)
+                self._mt(l, 'moe')
+                if self.ablit is not None:
+                    y = self._abl(l, 1, y)
+                if taps is not None:
+                    taps[f"L{l}.ffn"] = y.clone()
+                S.push(y, f_post, f_comb)
+                pre = f_pre
         st.length = max(getattr(st, "length", 0), start_pos + L)
         hid = torch.cat(main, dim=-1) if main else None
         if mode == "none":
             S.apply()
             return None, hid
+        d_cap = d_end
+        if d_cap != s_dev:
+            # endcap epilogue on part0 while the stream ended on the home device: prefill needs only the last
+            # row (mode "last"); a verify block ("all") is small enough to hop whole. mode "none" returns above.
+            if mode == "all":
+                S2 = self.hc_for(d_cap).new(self._hop(S.h, d_cap))
+                x = S2.cn(self._hop(pre, d_cap), self.norm_w)
+                logits = self.head_logits(x)
+            else:
+                S2 = self.hc_for(d_cap).new(self._hop(S.h[:, -1:], d_cap))
+                x = S2.cn(self._hop(pre[:, -1:], d_cap), self.norm_w)
+                logits = self.head_logits(x[:, -1])
+            return logits, hid
         x = S.cn(pre, self.norm_w)
         logits = self.head_logits(x if mode == "all" else x[:, -1])
         return logits, hid

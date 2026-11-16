@@ -35,6 +35,38 @@ def hip_available(device, dim: int, hc: int) -> bool:
     return torch.device(device).type == "cuda" and torch.cuda.is_available()
 
 
+def probe_hip(device, logger=print) -> bool:
+    """Split-mode guard: does the ds41kern kernel chain run *correct* small ops on `device`?
+
+    ``dsv41_hip.hip`` documents gfx1151; the fused-KDA port also builds dsv41_idx / dsv41_fuse for gfx12.
+    Any other architecture is untested territory. ``hip_available`` only checks "CUDA/HIP", so a device the
+    kernels were never built for would silently run the wrong ISA or mis-compute. This probe compiles and
+    launches rmsnorm_rows on the device and checks it against the torch reference, so a failed compile AND a
+    silent mis-compile both fall back to the torch path for that device. ``DSV41_SPLIT_HIP=0`` force-disables
+    the kernels on every split device (box comparisons of the two paths).
+    """
+    if os.environ.get("DSV41_SPLIT_HIP", "1") == "0":
+        return False
+    dv = torch.device(device)
+    if dv.type != "cuda" or not torch.cuda.is_available():
+        return True                       # the CPU emulator of the tests: serve_ops gates on its own checks
+    try:
+        from ..modules.dsv41_fn import dsv41_hip as K
+        x = (torch.randn(4, 512, device=dv) * 0.5).half()
+        w = torch.rand(512, device=dv).float() * 0.5 + 1.0
+        y = torch.empty_like(x)
+        K.rmsnorm_rows(x, w, y, 1e-6)
+        torch.cuda.synchronize(dv)
+        xf = x.float()
+        ref = (w * (xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + 1e-6))).half()
+        if not torch.allclose(y.float(), ref.float(), atol=0.02, rtol=0.02):
+            return False
+    except Exception as ex:                                    # noqa: BLE001 - any failure falls back
+        logger(f"[split] ds41 HIP probe failed on {dv}: {ex!r}")
+        return False
+    return True
+
+
 class TorchHC:
     """Reference dataflow in torch (any device / dtype of the sublayer output). Shapes: h [B, L, 4, D] fp32."""
 

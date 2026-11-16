@@ -55,7 +55,9 @@ SPLIT_PRESETS: dict[str, dict[str, str]] = {
     "auto": {},
     "glm": {},
     "qwen": {},
-    "ds41": {},
+    # DSV4: the SSD expert tier forces DSV41_DECODE_GRAPH=0 on its own (pack.load), and a split must
+    # never capture a graph that spans the host-staged bridge.
+    "ds41": {"DSV41_DECODE_GRAPH": "0"},
 }
 
 
@@ -147,6 +149,20 @@ def settings_from_namespace(args) -> SplitSettings:
         part0_reserve_gb = float(reserve),
         preset = (preset or "auto").strip().lower(),
         split_graphs = graphs,
+    )
+
+
+def settings_from_env() -> SplitSettings:
+    """SplitSettings from the environment only, for loaders (harnesses,ds41_model.load_model) that are
+    called without the server CLI. Same env keys settings_from_namespace falls back to."""
+    return SplitSettings(
+        part0_layers = parse_part0_layers(os.environ.get("KYOJIN_PART0_LAYERS", "0")),
+        part1_device = os.environ.get("KYOJIN_PART1_DEVICE") or "auto",
+        part0_device = os.environ.get("KYOJIN_PART0_DEVICE") or "auto",
+        endcaps = os.environ.get("KYOJIN_ENDCAPS", "1") != "0",
+        part0_reserve_gb = float(os.environ.get("KYOJIN_PART0_RESERVE_GB", str(DEFAULT_PART0_RESERVE_GB))),
+        preset = (os.environ.get("KYOJIN_SPLIT_PRESET", "auto") or "auto").strip().lower(),
+        split_graphs = "auto",
     )
 
 

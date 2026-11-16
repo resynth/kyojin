@@ -53,6 +53,8 @@ KYOJIN_PART1_DEVICE=gfx1151 \
 | `--part0-reserve-gb` | `KYOJIN_PART0_RESERVE_GB` | VRAM held as a load-time slab on `part0` for workspace (default 1.2) |
 | `--split-preset auto\|glm\|qwen\|ds41\|none` | `KYOJIN_SPLIT_PRESET` | per-model unsafe-environment preset; GLM needs none today |
 | `--split-graphs auto\|on\|off` | - | reserved for per-segment capture; split currently runs graphs off |
+| - | `KYOJIN_DS41_TIER_DEVICE` | DSV4 only: which side hosts the SSD expert tier (`part1` default; `part0` only on explicit request) |
+| `KYOJIN_BRIDGE_CHUNK_MB` | - | DSV4: the pinned-staging budget the prefill bridge slices against (default 256) |
 
 `cuda:N` is the torch device index **after** `HIP_VISIBLE_DEVICES`, not the `rocm-smi`
 index. Explicit selectors win in either position: `part0=cuda:1/part1=cuda:0` and
@@ -94,12 +96,56 @@ Text endcaps are selected by a class/key allowlist, not by per-model placement i
 | --- | --- | --- |
 | GLM-5.3-Flash | measured | text, MTP and vision; on a 16 GiB `gfx12` `part0`, N=6 fits short context (MTP off), N=4 is the 128K MTP setting, and N=5 fits 500K |
 | Qwen3.8-Flash-Next | staged, not load-tested | QSA/GDN/PLE components; separate dflash drafter config; QSA `gfx12` caveat below |
-| DeepSeek-V4.1-Flash | staged | uses the DSV4 engine, not `Model.load` |
+| DeepSeek-V4.1-Flash | implemented (text first), not load-tested | own adapter (`tools/ds41/serve.py`); see the DSV4 section below |
 | Flint, Mimo | best effort | generic `Model` path; no dedicated adapter |
 
 Kernel support is per architecture. The split owns placement and transport, not kernel
 ports; a missing kernel fallback on a new architecture is a model/kernel issue, not a split
 defect.
+
+### DeepSeek-V4.1-Flash
+
+The DSV4 engine builds its serving model itself (`exllamav3/dsv41/pack.py`), so the split
+adapter is DSV4-local placement (`exllamav3/dsv41/placement.py`) on top of the shared
+device selection, settings and bridge. Differences from the generic map:
+
+- **Boundaries are structural.** DSV4 layers read other layers' compressed-KV and
+  indexer-key pools and the candidate-block selection produced by
+  `candidate_source_layer_id`. A boundary is valid only when every producer a `part1`
+  layer needs is itself on `part1`. For the default 40-layer config the allowed
+  `--part0-layers` values are therefore `0, 1, 2, 8, 14, 20, 40` (computed from the
+  config, never hardcoded); any other N fails at startup with this list. `N=1` or `N=2`
+  is the intended target (the small card holds the front).
+- **`auto` is rejected for DSV4 in this stage** — use a manual N.
+- **Endcaps carry the MTP.** DSpark reads `embed`/`head`, so endcaps and the MTP/draft
+  stages always share one device: `part0` with `--endcaps on`, `part1` with
+  `--endcaps off`. If that does not fit the part0 budget, the load fails with a clear
+  message; reduce N or use `--endcaps off` / fewer draft tokens.
+- **SSD expert tier on one device.** With `EXL3_EXPERT_BUDGET_GIB` on, the tier streams
+  onto exactly one device — `part1` by default, `KYOJIN_DS41_TIER_DEVICE=part0` only on
+  explicit request. Front layers never register with the store: their experts are
+  resident, and the front never reads the tier.
+- **Graphs off** (`DSV41_DECODE_GRAPH=0` via the `ds41` preset), and the kernels on each
+  device are probed at load: a device where the ds41 HIP kernels cannot compile or
+  compute correctly falls back to the torch path for that device (see
+  `DSV41_SPLIT_HIP=0` to force the torch path everywhere for comparisons).
+- **Bounded bridge staging.** A 32K `part0`→`part1` crossing is a 2.69 GB fp32 tensor;
+  `hop_chunk` slices such crossings so the pinned staging stays near
+  `KYOJIN_BRIDGE_CHUNK_MB` (default 256 MiB) ×2 slots instead of two full chunks.
+
+Example (the working orientation is the small card as `part0`):
+
+```sh
+KYOJIN_PART0_LAYERS=1 \
+KYOJIN_PART0_DEVICE=gfx1201 \
+KYOJIN_PART1_DEVICE=gfx1151 \
+KYOJIN_ENDCAPS=on \
+  python tools/ds41/serve.py --model /path/to/ds41-pack --num-draft 0 --engine-opt prefill_chunk=32768
+```
+
+The reverse orientation is selectable but not fit-feasible for this pack: a safe tail
+boundary would have to sit at or above the candidate source layer, which puts the tail
+layers' resident experts on the small card.
 
 ## Verification
 

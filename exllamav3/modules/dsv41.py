@@ -255,9 +255,16 @@ class DSV41Block(Module):
         self._w = None
 
     def _tier_register(self, device):
-        """TierSet when the SSD expert store is on and this trunk block qualifies (CUDA, no pruned experts), else None."""
+        """TierSet when the SSD expert store is on and this trunk block qualifies (CUDA, no pruned experts), else None.
+
+        DSV4 layer split (dsv41.placement): with a boundary set, the store lives on exactly one device
+        (cfg._expert_tier_device, part1 unless asked otherwise). A block on any other device never
+        registers: its experts load resident, and the 9070 keeps its front layers off the SSD tier."""
+        from ..dsv41.placement import tier_allows
         if (self.mtp or self.pruned or device is None or torch.device(device).type != "cuda" or
                 os.environ.get("EXL3_EXPERT_BUDGET_GIB", "") == ""):
+            return None
+        if not tier_allows(self.config, device):
             return None
         from .expert_store import get_store
         return get_store(self.config).register(_TierView(self), device)

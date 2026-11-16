@@ -456,6 +456,10 @@ def engram_inject(h: torch.Tensor, hash_ids: torch.Tensor, store: EngramRowStore
     """h [B,L,hc,dim] (residual streams) + hashes [B,L,n_cols] -> updated streams (model.py:350).
     wkv: callable [.., n_cols*256] -> [.., dim*(hc+1)] ; qk_weight = q_weight*k_weight [hc, dim]."""
     B, L, nc = hash_ids.shape
+    if hash_ids.device != h.device:
+        # a split: the hasher (and its history) live on the home device, the engram layer may sit on the
+        # other one. torch.unique must run beside the gather it feeds; the ids are [B, L, n_cols] int64.
+        hash_ids = hash_ids.to(h.device)
     flat = hash_ids.reshape(-1)
     uniq, inv = torch.unique(flat, return_inverse=True)
     rows = dequant_rows(store.fetch(layer_pos, uniq), h.dtype, getattr(store, "fmt", "fp8")).to(h.device)

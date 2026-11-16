@@ -33,6 +33,10 @@ from serve_ping import ServePing  # noqa: E402  (SSE keep-alive comments; off by
 import ds41_chat  # noqa: E402
 import ds41_engine  # noqa: E402
 import ds41_parse  # noqa: E402
+# Shared split helper (symlink to exllamav3/serve_split.py): pure stdlib at import.
+from kyojin_serve_split import (  # noqa: E402
+    add_split_arguments, apply_split_env, settings_from_namespace,
+)
 
 DEFAULT_MODEL = "~/models/deepseek-v4.1-flash-1017"
 # What the model card recommends. Used when the pack has no generation_config.json (the Hugging Face repo of the
@@ -937,10 +941,17 @@ def main() -> None:
                         help="thinking effort when a request omits it: minimal, low, medium, high, xhigh, max or an integer 1..100 (default: high)")
     parser.add_argument("--default-thinking", choices=("on", "off"), default="on",
                         help="thinking mode when a request does not choose (default: on)")
+    add_split_arguments(parser)
     args = parser.parse_args()
 
     defaults = build_defaults(args)
     engine_opts = parse_engine_opts(args.engine_opt)
+    split_settings = settings_from_namespace(args)
+    if split_settings.enabled:
+        # The env forcing must happen before the loader imports exllamav3 modules that read these keys.
+        apply_split_env(split_settings, logger=lambda m: print(f"serve: {m}", flush=True))
+    if split_settings.enabled and args.loader != "stub":
+        engine_opts["split"] = dict(vars(split_settings))
     if args.num_draft < 0:
         raise SystemExit("serve: --num-draft must be >= 0")
     if args.draft_conf is not None and not 0 < args.draft_conf < 1:

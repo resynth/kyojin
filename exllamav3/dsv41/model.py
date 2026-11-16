@@ -136,12 +136,22 @@ class DSV41Graph:
         self.ablit = None
         self._img_rows = None       # bool [rows] of the pass in flight: rows inside an image span (VL routing bias)
 
+    def text_device(self, l: int) -> torch.device:
+        """Device of trunk layer l (= MTP stage l for l >= num_hidden_layers). Single device here; the
+        serving split (`dsv41.placement`) overrides this."""
+        return self.device
+
+    def _device_of(self, l: int, device=None) -> torch.device:
+        return self.device if device is None else torch.device(device)
+
     def _route_bias(self, w):
         """Expert-selection bias: `gate_b`, or per row `gate_b_vl` for the rows of an image span."""
         m = self._img_rows
         vl = getattr(w, "gate_b_vl", None)
         if m is None or vl is None:
             return w.gate_b
+        if m.device != vl.device:
+            m = m.to(vl.device)     # a split's image mask is built on the home device, the gate on the layer device
         return torch.where(m.unsqueeze(-1), vl, w.gate_b)
 
     def set_ablit(self, model_dir = None):
@@ -160,16 +170,17 @@ class DSV41Graph:
             y = y.contiguous()
         return ablit_runtime.project(y, a[l][which], *a[l][2:])
 
-    def _rope_for(self, ratio: int, max_seq: int):
+    def _rope_for(self, ratio: int, max_seq: int, device=None):
         cfg = self.cfg
-        key = (bool(ratio), max_seq)
+        dv = self.device if device is None else torch.device(device)
+        key = (bool(ratio), max_seq, str(dv))       # device-keyed: a split builds one table per side
         if key not in self._rope:
             if ratio:
                 a = (cfg.original_seq_len, cfg.compress_rope_theta)
             else:
                 a = (0, cfg.rope_theta)       # sliding layers: plain rope, no yarn
             self._rope[key] = ops.rope_tables(cfg.qk_rope_head_dim, max_seq, a[0], a[1], cfg.rope_factor,
-                                              cfg.beta_fast, cfg.beta_slow, self.device)
+                                              cfg.beta_fast, cfg.beta_slow, dv)
         return self._rope[key]
 
 
@@ -431,8 +442,9 @@ class DSV41Model(DSV41Graph):
         self.set_ablit(ablit_dir)
 
     # ---------------------------------------------------------------- weights
-    def _load_layer(self, l):
-        cfg, s, dt, dv = self.cfg, self.src, self.dtype, self.device
+    def _load_layer(self, l, device=None):
+        cfg, s, dt = self.cfg, self.src, self.dtype
+        dv = self._device_of(l, device)
         p = s.layer_prefix(l)
         w = _LW()
         w.l = l

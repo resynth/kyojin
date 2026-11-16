@@ -154,13 +154,15 @@ def subset_config(dcfg: DSV41Config, layers: int = None, mtp: bool = True) -> DS
 
 
 def load(model_dir: str, device="cuda:0", dtype=torch.float16, layers: int = None, mtp: bool = True,
-         moe: str = "auto", prefill_chunk: int = 2048, engram_store=None, log=None, **kw):
+         moe: str = "auto", prefill_chunk: int = 2048, engram_store=None, log=None, placement=None, **kw):
     """Load the pack in `model_dir` into a `DSV41Serving` on `device`.
 
     layers  only the first N trunk layers (+ embed / final norm / head): the smoke test of a real pack on one layer
     mtp     load the dspark stages when the pack has them
     moe     "auto": mixed-K grouped kernels where the device and the tensors allow (else per-expert loop), "loop": always loop
     engram_store  an `EngramRowStore` (default: the pack's shards, or $EXL3_DSV41_ENGRAM_DIR)
+    placement  a `dsv41.placement.DSV41Placement` for the contiguous layer split (dsv41.placement); None = split off,
+               which loads exactly as before (single device, no bridge, no env changes)
     """
     from ..model.config import Config
     from ..model.model import Model
@@ -168,41 +170,138 @@ def load(model_dir: str, device="cuda:0", dtype=torch.float16, layers: int = Non
     from .serve_model import DSV41Serving
     from .serve_moe import GroupedMoE, LoopMoE, grouped_available
     log = log or (lambda s: None)
+    if layers is not None and placement is not None:
+        raise ValueError("pack.load: the --layers smoke subset and the layer split are mutually exclusive")
+    split = placement is not None and placement.part0_layers > 0
+    if split:
+        # D6: graphs and the split's host-staged crossing never mix. Forced before the serving model reads
+        # the env (DSV41Serving.__init__ captures decode_graph), regardless of the tier.
+        os.environ["DSV41_DECODE_GRAPH"] = "0"
     dev = torch.device(device)
     cfg = Config.from_directory(model_dir, **({"dsv41_engram_store": engram_store} if engram_store else {}))
     full = cfg.dsv41
     dcfg = subset_config(full, layers, mtp and cfg.dsv41_n_mtp > 0)
     n_load = dcfg.num_hidden_layers
     qcfg = cfg.config_dict.get("quantization_config") or {}
+    if split:
+        if placement.cfg is not dcfg:
+            import dataclasses
+            placement = dataclasses.replace(placement, cfg=dcfg)
+        cfg._expert_tier_device = placement.tier          # the tier guard (modules/dsv41.py) reads this
+        cfg._dsv41_placement = placement
+        from ..bridge import install_bridge
+        placement.bridge = install_bridge(cfg, part1=placement.part1, part0=placement.part0)
+        bridge_desc = placement.bridge.describe() if placement.bridge else "disabled (KYOJIN_BRIDGE=0): direct/host copies"
+        log(f"[split] bridge: {bridge_desc}")
 
     text = Model.from_config(cfg)
     src = PackSource(full.num_hidden_layers)
     blocks = []
-    for mod in text.modules:
-        key = mod.key
-        if key.startswith("layers.") and int(key.split(".")[1]) >= n_load:
-            continue
-        mod.load(dev)
-        log(f"loaded {key}")
-        if key == "embed":
-            src.embed = mod.embedding.weight.data
-        elif key == "norm":
-            src.norm = mod.w
-        elif key == "head":
-            src.lins["head"] = PackLin(mod.head)
-        elif key.startswith("layers."):
-            src.add_block(mod)
-            blocks.append(mod)
-    mtp_mod = None
-    if dcfg.n_mtp_layers:
-        mtp_mod = Model.from_config(cfg, component="mtp")
-        for mod in mtp_mod.modules:
-            mod.load(dev)
-            log(f"loaded {mod.key}")
-            if mod.key == "mtp.extra":
-                src.add_extra(mod, mtp_mod.main_proj)
+    per_dev_bytes: dict = {}
+    if split:
+        d_end, d0 = placement.endcap_device, placement.part0
+        plan = []
+        for mod in text.modules:
+            key = mod.key
+            if key.startswith("layers.") and int(key.split(".")[1]) >= n_load:
+                continue
+            if key.startswith("layers."):
+                dv = placement.text_device(int(key.split(".")[1]))
+            elif key in ("embed", "hc_expand", "norm", "head"):
+                dv = d_end
             else:
+                dv = d_end                                # any stub module rides with the endcaps
+            plan.append((mod, dv))
+        if dcfg.n_mtp_layers:
+            mtp_mod_plan = Model.from_config(cfg, component="mtp")
+            plan += [(mod, placement.mtp_device) for mod in mtp_mod_plan.modules]
+            text_mtp = mtp_mod_plan
+        else:
+            text_mtp = None
+        # startup budget estimate to sanity-check the 9070 front budget before the load (no auto-N)
+        try:
+            from .placement import estimate_front_bytes
+            def _numel(key, _t=text, _m=text_mtp):
+                try:
+                    mod = _t.find_module(key)
+                except (KeyError, AttributeError):
+                    try:
+                        mod = _m.find_module(key) if _m is not None else None
+                    except (KeyError, AttributeError):
+                        mod = None
+                return mod.weights_numel() if mod is not None else 0
+            try:
+                qbits = float(qcfg.get("bits", 2.9))
+            except (TypeError, ValueError):
+                qbits = 2.9
+            est = estimate_front_bytes(placement, _numel, bits=qbits)
+            log(f"[split] front budget estimate: {est['total_gib']:.2f} GiB of weights on part0 "
+                f"(layers {est['layers']}, endcaps {est['endcap_bytes'] / 2**30:.2f} GiB, "
+                f"MTP {est['mtp_bytes'] / 2**30:.2f} GiB) + {placement.part0_reserve_gb:.2f} GiB reserve")
+        except Exception as ex:                                   # noqa: BLE001 - informative only
+            log(f"[split] front budget estimate unavailable ({ex!r})")
+        # part0 reserve slab: held while the front (and, later, the endcap / MTP) modules load, released
+        # just before the first part1 module so the front load always has its headroom on the 9070.
+        reserve_bytes = int(placement.part0_reserve_gb * (1 << 30))
+        slab = None
+        for mod, dv in plan:
+            if dv != d0:
+                if slab is not None:
+                    slab = None                           # release before the first part1 module
+                    log("split: part0 reserve released")
+            elif slab is None and reserve_bytes:
+                try:
+                    slab = torch.empty(reserve_bytes, dtype=torch.uint8, device=d0)
+                except RuntimeError as ex:
+                    log(f"split: part0 reserve of {placement.part0_reserve_gb:.2f} GiB not engageable "
+                        f"({ex}); the end-of-load check still applies")
+                    slab = None
+            before = torch.cuda.memory_allocated(dv)
+            mod.load(dv)
+            per_dev_bytes[dv] = per_dev_bytes.get(dv, 0) + (torch.cuda.memory_allocated(dv) - before)
+            key = mod.key
+            log(f"loaded {key} on {dv}")
+            if key == "embed":
+                src.embed = mod.embedding.weight.data
+            elif key == "norm":
+                src.norm = mod.w
+            elif key == "head":
+                src.lins["head"] = PackLin(mod.head)
+            elif key.startswith("layers."):
                 src.add_block(mod)
+                blocks.append(mod)
+            elif key == "mtp.extra":
+                src.add_extra(mod, text_mtp.main_proj)
+            elif key.startswith("mtp."):
+                src.add_block(mod)                    # MTP blocks are picked up through mtp_mod below, like single-device
+        slab = None
+        mtp_mod = text_mtp
+    else:
+        for mod in text.modules:
+            key = mod.key
+            if key.startswith("layers.") and int(key.split(".")[1]) >= n_load:
+                continue
+            mod.load(dev)
+            log(f"loaded {key}")
+            if key == "embed":
+                src.embed = mod.embedding.weight.data
+            elif key == "norm":
+                src.norm = mod.w
+            elif key == "head":
+                src.lins["head"] = PackLin(mod.head)
+            elif key.startswith("layers."):
+                src.add_block(mod)
+                blocks.append(mod)
+        mtp_mod = None
+        if dcfg.n_mtp_layers:
+            mtp_mod = Model.from_config(cfg, component="mtp")
+            for mod in mtp_mod.modules:
+                mod.load(dev)
+                log(f"loaded {mod.key}")
+                if mod.key == "mtp.extra":
+                    src.add_extra(mod, mtp_mod.main_proj)
+                else:
+                    src.add_block(mod)
 
     store = tm = mult = None
     if dcfg.engram_layer_ids:
@@ -212,23 +311,35 @@ def load(model_dir: str, device="cuda:0", dtype=torch.float16, layers: int = Non
             dcfg.engram_compressed_vocab_size = eg["compressed_vocab"]
         store = engram_store or cfg.engram_store()
     tiered = [b for b in blocks if getattr(b, "tier", None) is not None]
+    tier_dev = placement.tier if split else dev
     if tiered:
         # SSD expert tier (EXL3_EXPERT_BUDGET_GIB): the kernels address experts through the store's slot tables; the decode
         # graph would capture stale table contents and the host sync of the store cannot run inside a capture
         os.environ["DSV41_DECODE_GRAPH"] = "0"
-        if moe == "loop" or not grouped_available(dev):
+        if moe == "loop" or not grouped_available(tier_dev):
             raise RuntimeError("EXL3_EXPERT_BUDGET_GIB needs the grouped MoE kernels (moe=auto on a GPU with the extension)")
+        if split:
+            bad = [b.key for b in tiered if torch.device(b.device) != tier_dev]
+            if bad:
+                raise RuntimeError(f"split: tiered layers {bad} are not on the tier device {tier_dev}")
     model = DSV41Serving(dcfg, src, None, store, token_map=tm, multipliers=mult, dtype=dtype, device=dev,
-                         prefill_chunk=prefill_chunk, ablit_dir=kw.pop("ablit_dir", cfg.directory), **kw)
+                         prefill_chunk=prefill_chunk, ablit_dir=kw.pop("ablit_dir", cfg.directory),
+                         placement=placement, **kw)
     model.pack_modules = (text, mtp_mod)                      # keep the module trees (and their tensors) alive
-    if moe != "loop" and grouped_available(dev):
+    if moe != "loop":
         for b in blocks + [m for m in (mtp_mod.modules if mtp_mod else []) if m.key != "mtp.extra"]:
+            bdv = torch.device(b.device)
+            if not grouped_available(bdv):
+                if getattr(b, "tier", None) is not None:
+                    raise RuntimeError(f"{b.key}: tiered layer needs the grouped MoE kernels on {bdv}")
+                continue                        # this device cannot host the grouped kernels: per-expert loop
             if b.pruned:
                 log(f"{b.key}: {len(b.pruned)} pruned experts; per-expert loop")
                 continue
             try:
                 eb = parse_expert_bits(qcfg, f"{b.key}.ffn", b.n_exp)
-                be = GroupedMoE(b.ex_w1, b.ex_w3, b.ex_w2, dcfg, dev, eb, fallback=model.loop_moe, layer=b.l)
+                be = GroupedMoE(b.ex_w1, b.ex_w3, b.ex_w2, dcfg, bdv, eb,
+                                fallback=model.loop_moe_for(bdv), layer=b.l)
                 if getattr(b, "tier", None) is not None:
                     if not (be.decode_ok and be.wmma_ok):
                         raise RuntimeError(f"{b.key}: tiered layer needs the grouped decode and prefill kernels")
@@ -241,5 +352,22 @@ def load(model_dir: str, device="cuda:0", dtype=torch.float16, layers: int = Non
                 log(f"{b.key}: grouped MoE unavailable ({ex}); per-expert loop")
     if tiered:
         from ..modules.expert_store import get_store
-        get_store(cfg).finalize()                              # allocate the slot pools after every other allocation of the load
+        st_ = get_store(cfg)
+        st_.finalize()                                     # allocate the slot pools after every other allocation of the load
+        if split:
+            if torch.device(st_.device) != tier_dev:
+                raise RuntimeError(f"split: expert store device {st_.device} != tier device {tier_dev}")
+            front = [b.key for b in blocks if placement.front(b.l) and getattr(b, "tier", None) is not None]
+            if front:
+                raise RuntimeError(f"split: front layers {front} registered with the expert tier")
+            log(f"[split] expert tier on {tier_dev}; front layer(s) resident, no SSD reads")
+            lines = ", ".join(f"{dv}: {nb / 2**30:.2f} GiB" for dv, nb in per_dev_bytes.items())
+            log(f"[split] load table (weights): {lines}")
+            free = torch.cuda.mem_get_info(placement.part0)[0]
+            need = int(placement.part0_reserve_gb * (1 << 30))
+            log(f"[split] part0 free after load: {free / 2**30:.2f} GiB (reserve {placement.part0_reserve_gb:.2f} GiB)")
+            if free < need:
+                raise RuntimeError(f"split: part0 ({placement.part0}) has only {free / 2**30:.2f} GiB free after "
+                                   f"the load but the reserve wants {placement.part0_reserve_gb:.2f} GiB. "
+                                   "Reduce --part0-layers, use --endcaps off, or run with --num-draft 0.")
     return model

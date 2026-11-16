@@ -54,11 +54,16 @@ class _Channel:
 
 class Bridge:
 
-    def __init__(self, *, part1: torch.device, part0: torch.device):
+    def __init__(self, *, part1: torch.device, part0: torch.device, max_chunk_bytes: int | None = None):
         self.part1 = torch.device(part1)
         self.part0 = torch.device(part0)
+        if max_chunk_bytes is None:
+            max_chunk_bytes = int(float(os.environ.get("KYOJIN_BRIDGE_CHUNK_MB", "256")) * (1 << 20))
+        # 0 = unbounded staging (the pre-split behavior); everything else keeps a prefill-sized crossing's
+        # pinned slot at or below this many bytes by slicing it (see hop_chunk).
+        self.max_chunk_bytes = max(0, int(max_chunk_bytes))
         self.channels: dict[tuple[int, int], _Channel] = {}
-        self.stats = {"hops": 0, "bytes": 0, "chunk_hops": 0, "chunk_bytes": 0, "reallocs": 0}
+        self.stats = {"hops": 0, "bytes": 0, "chunk_hops": 0, "chunk_bytes": 0, "reallocs": 0, "slices": 0}
 
     # -- configuration -----------------------------------------------------
 
@@ -82,11 +87,48 @@ class Bridge:
         """Move ``t`` to ``dst`` through pinned host staging, asynchronously."""
         return self._hop(t, dst, chunk = False)
 
-    def hop_chunk(self, t: torch.Tensor, dst: torch.device) -> torch.Tensor:
-        """Prefill-sized crossing. Double-buffered like every hop; reported separately."""
-        return self._hop(t, dst, chunk = True)
+    def hop_chunk(self, t: torch.Tensor, dst: torch.device, max_bytes: int | None = None) -> torch.Tensor:
+        """Prefill-sized crossing, bounded. Like every hop it goes through the double-buffered slots, and
+        tensors above the staging budget (default KYOJIN_BRIDGE_CHUNK_MB = 256 MiB) are sliced: a 32K DSV4
+        chunk is 2.69 GB fp32 and whole-tensor slots would pin ~5.4 GB double-buffered. Each slice hops
+        through the slot ring on the two devices' streams (stream-ordered, never host-blocking) and the
+        slices assemble into the preallocated destination on the destination stream."""
+        dst = torch.device(dst)
+        if t.device == dst:
+            return t
+        if t.device.type != "cuda" or dst.type != "cuda":
+            return t.to(dst)
+        if not t.is_contiguous():
+            t = t.contiguous()
+        mb = self.max_chunk_bytes if max_bytes is None else max(0, int(max_bytes))
+        if not mb or t.numel() * t.element_size() <= mb:
+            return self._hop(t, dst, chunk = True)
+        out = torch.empty(t.shape, dtype = t.dtype, device = dst)
+        src_flat = t.view(-1)
+        dst_flat = out.view(-1)
+        slices = self.slice_plan(src_flat.numel(), t.element_size(), mb)
+        self.stats["slices"] += len(slices) - 1            # plain hops are not counted as slices
+        with torch.cuda.device(dst):
+            cur = torch.cuda.current_stream(dst)
+            with torch.cuda.stream(cur):
+                for a, b in slices:
+                    got = self._hop(src_flat[a:b], dst, chunk = True)
+                    dst_flat[a:b].copy_(got, non_blocking = True)   # ordered after this slice's H2D
+        return out
 
     # -- implementation ----------------------------------------------------
+
+    @staticmethod
+    def slice_plan(numel: int, element_size: int, max_bytes: int) -> list[tuple[int, int]]:
+        """(start, stop) element slices covering [0, numel) with every slice at or below the staging budget,
+        near-equal and without a short tail (a 1-element tail slice would still cycle a whole slot ring).
+        Pure arithmetic, unit-testable without GPUs."""
+        if max_bytes <= 0 or numel * element_size <= max_bytes:
+            return [(0, numel)]
+        n = max(1, max_bytes // element_size)
+        k = -(-numel // n)
+        step = -(-numel // k)
+        return [(a, min(numel, a + step)) for a in range(0, numel, step)]
 
     def _channel(self, src: torch.device, dst: torch.device) -> _Channel:
         key = (src.index or 0, dst.index or 0)

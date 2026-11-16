@@ -61,6 +61,11 @@ class DSV41Cache(DSV41State):
 
     def __init__(self, model: DSV41Model, batch: int = 1, max_seq: int = 4096, page: int = PAGE_ROWS):
         cfg, dev, dt = model.cfg, model.device, model.dtype
+        # each layer's ring (and each source layer's pools) live on that layer's device: the layer reads and
+        # writes them in its own forward. With the split off text_device(l) is model.device for every l; a
+        # safe split boundary guarantees a pool's producer and every consumer are on the same side, so the
+        # pool rides with its source layer.
+        td = model.text_device
         self.batch, self.max_seq, self.page = batch, max_seq, page
         self.journal = None
         self.length = 0
@@ -69,7 +74,7 @@ class DSV41Cache(DSV41State):
         # pools and the ring hold fake-quant values: fp16 is lossless for them (and what the kernels read)
         pdt = dt if dt in (torch.float16, torch.float32) else torch.float16
         self.pool_dtype = pdt
-        self.win = {l: torch.zeros(batch, W, hd, dtype=pdt, device=dev) for l in range(n + cfg.n_mtp_layers)}
+        self.win = {l: torch.zeros(batch, W, hd, dtype=pdt, device=td(l)) for l in range(n + cfg.n_mtp_layers)}
         self._kv, self._ik = {}, {}
         self.comp_kv, self.idx_k = {}, {}
         self.packed = os.environ.get("DSV41_IDX_PACKED", "0") == "1"   # the packed copy exists only when the kernels read it
@@ -81,16 +86,17 @@ class DSV41Cache(DSV41State):
                 continue
             r = cfg.ratio(l)
             rows = max_seq // r
-            self._kv[l] = PagedPool(batch, hd, pdt, dev, rows, page)
-            self._ik[l] = PagedPool(batch, cfg.index_head_dim, pdt, dev, rows, page)
+            pdev = td(l)
+            self._kv[l] = PagedPool(batch, hd, pdt, pdev, rows, page)
+            self._ik[l] = PagedPool(batch, cfg.index_head_dim, pdt, pdev, rows, page)
             self.comp_kv[l], self.idx_k[l] = self._kv[l].t, self._ik[l].t
             if self.packed:
-                self._iq[l] = PagedPool(batch, cfg.index_head_dim // 2, torch.uint8, dev, rows, page)
-                self._is[l] = PagedPool(batch, cfg.index_head_dim // 32, torch.uint8, dev, rows, page)
+                self._iq[l] = PagedPool(batch, cfg.index_head_dim // 2, torch.uint8, pdev, rows, page)
+                self._is[l] = PagedPool(batch, cfg.index_head_dim // 32, torch.uint8, pdev, rows, page)
                 self.idx_kq[l], self.idx_ks[l] = self._iq[l].t, self._is[l].t
             if r > 1:
-                self.comp_kv_state[l] = torch.zeros(batch, r, hd, dtype=torch.float32, device=dev)
-                self.comp_score_state[l] = torch.full((batch, r, hd), -torch.inf, dtype=torch.float32, device=dev)
+                self.comp_kv_state[l] = torch.zeros(batch, r, hd, dtype=torch.float32, device=pdev)
+                self.comp_score_state[l] = torch.full((batch, r, hd), -torch.inf, dtype=torch.float32, device=pdev)
         self.hasher = None
         if model.engram_layout is not None:
             self.hasher = NgramHasher(model.engram_layout, model.token_map, cfg.engram_pad_token_id,

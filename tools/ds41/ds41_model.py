@@ -515,15 +515,72 @@ def resolve_spec_hook(spec_hook: Any):
     return getattr(importlib.import_module(mod), fn or "make_spec")
 
 
+def _split_settings(split: dict | None):
+    """Loader-facing split settings: an explicit dict (the server's --part0-* flags) or the KYOJIN_* env;
+    None when the split is off (no env key set / KYOJIN_PART0_LAYERS=0)."""
+    from exllamav3.serve_split import SplitSettings, settings_from_env
+    if split:
+        fields = SplitSettings.__dataclass_fields__
+        vals = {k: v for k, v in dict(split).items() if k in fields}
+        return SplitSettings(**vals)
+    if os.environ.get("KYOJIN_PART0_LAYERS", "").strip():
+        return settings_from_env()
+    return None
+
+
+_SPLIT_ENV_DONE = False
+
+
+def _apply_split_env_once(settings):
+    """serve.py applies the split env for its own run; loaders reached without the CLI (harnesses) still
+    get the graph/fusion env forced exactly once."""
+    global _SPLIT_ENV_DONE
+    if not settings.enabled or _SPLIT_ENV_DONE:
+        return
+    from exllamav3.serve_split import SPLIT_UNSAFE_ENV, GRAPH_ENV_OFF, apply_split_env
+    forced = {**SPLIT_UNSAFE_ENV, **GRAPH_ENV_OFF}
+    if all(os.environ.get(k) == v for k, v in forced.items()):
+        _SPLIT_ENV_DONE = True                     # serve.py already applied it: no second log line
+        return
+    apply_split_env(settings, logger=lambda m: print(f"serve: {m}", flush=True))
+    _SPLIT_ENV_DONE = True
+
+
+def resolve_split(split: dict | None, pack_dir: str):
+    """Split dict / env -> (settings, DSV41Placement | None). Placement None = split off."""
+    settings = _split_settings(split)
+    if settings is None or not settings.enabled:
+        return settings, None
+    _apply_split_env_once(settings)
+    if settings.auto:
+        raise RuntimeError("DSV4 layer split needs a manual N (--part0-layers N / KYOJIN_PART0_LAYERS); "
+                           "auto-N is a later stage")
+    import torch
+    from exllamav3.device_map import resolve_devices
+    from exllamav3.dsv41.config import DSV41Config
+    from exllamav3.dsv41.placement import resolve_placement
+    dcfg = DSV41Config.from_file(str(Path(pack_dir).expanduser() / "config.json"))
+    devices = resolve_devices(settings.part0_device, settings.part1_device)
+    placement = resolve_placement(settings, dcfg, devices=devices,
+                                  logger=lambda m: print(f"serve: {m}", flush=True))
+    return settings, placement
+
+
 def load_pack(path: str, *, device: str, dtype: str, num_draft: int = 0, layers: int | None = None, moe: str = "auto",
-              prefill_chunk: int = 2048, engram_dir: str | None = None):
-    """The serving model of a pack. The DSpark stages are loaded only when drafting is asked for."""
+              prefill_chunk: int = 2048, engram_dir: str | None = None, split: dict | None = None,
+              placement=None):
+    """The serving model of a pack. The DSpark stages are loaded only when drafting is asked for. With the
+    layer split on, the home device is part1 (the model.device the engine keeps), whatever --device said."""
     import torch
     from exllamav3.dsv41.pack import load
     if engram_dir:
         os.environ["EXL3_DSV41_ENGRAM_DIR"] = str(Path(engram_dir).expanduser())
+    if placement is None and split is not None:
+        _st, placement = resolve_split(split, path)
+    if placement is not None:
+        device = str(placement.part1)
     return load(str(Path(path).expanduser()), device=device, dtype=getattr(torch, dtype), layers=layers,
-                mtp=bool(num_draft), moe=moe, prefill_chunk=int(prefill_chunk),
+                mtp=bool(num_draft), moe=moe, prefill_chunk=int(prefill_chunk), placement=placement,
                 log=lambda m: print(f"serve: {m}", flush=True))
 
 
@@ -594,8 +651,13 @@ def load_model(path: str, ctx: int, *, num_draft: int = 0, device: str | None = 
                seed: int | None = None, layers: int | None = None, moe: str = "auto", prefill_chunk: int = 2048,
                prefix_cache: bool = True, spec_hook: Any = None, draft_auto: Any = False,
                draft_conf_threshold: float | None = None, vision: Any = "auto", vision_device: str | None = None,
-               vision_dtype: str = "bfloat16", vision_cache: int = 8, **_: Any) -> PortEngine:
-    """`--loader ds41_model:load_model`. Unknown options are ignored (the server passes only what the command line gave)."""
+               vision_dtype: str = "bfloat16", vision_cache: int = 8, split: dict | None = None,
+               **_: Any) -> PortEngine:
+    """`--loader ds41_model:load_model`. Unknown options are ignored (the server passes only what the command line gave).
+
+    `split`: the layer split settings (dict: part0_layers / part0_device / part1_device / endcaps /
+    part0_reserve_gb / preset, from serve.py --part0-*); None falls back to the KYOJIN_PART0_* env, and an
+    unset/zero N loads exactly as before (single device, no env changes, no bridge)."""
     import torch
     if threads:
         torch.set_num_threads(int(threads))
@@ -604,14 +666,20 @@ def load_model(path: str, ctx: int, *, num_draft: int = 0, device: str | None = 
     gpu = torch.cuda.is_available()                           # also true on ROCm
     device = device or ("cuda:0" if pack and gpu else "cpu")
     dtype = dtype or ("float16" if pack and device.startswith("cuda") else "float32")
+    _st, placement = resolve_split(split, str(root))
+    if placement is not None and not pack:
+        raise RuntimeError("the layer split supports converted EXL3 packs (pack.load); the official-"
+                           "safetensors / GGUF source models are single-device")
     if pack:
         model = load_pack(str(root), device=device, dtype=dtype, num_draft=int(num_draft or 0), layers=layers, moe=moe,
-                          prefill_chunk=prefill_chunk, engram_dir=engram_dir)
+                          prefill_chunk=prefill_chunk, engram_dir=engram_dir, placement=placement)
     else:
         model = build_model(str(root), device=device, dtype=dtype, engram_dir=engram_dir, cache_experts=bool(cache_experts))
     tkdir = root if root.is_dir() else root.parent
     tk = HFTokenizer(tkdir / "tokenizer.json")
     model.pack_id = pack_identity(root, engram_dir)             # the persistent prompt cache is keyed on the weights it was computed with
+    if placement is not None:
+        vision_device = str(placement.vision_device)            # D8: vision defaults to part1
     vkw = vision_kwargs(tkdir, vision, vision_device, vision_dtype, vision_cache)
     return PortEngine(model, tk, ctx=int(ctx), num_draft=int(num_draft or 0), eos_id=_hf_eos(tkdir, tk._tk), seed=seed,
                       draft_auto=str(draft_auto).lower() not in ("0", "false", "no", "off", ""),
