@@ -86,10 +86,13 @@ class SplitSettings:
     part0_reserve_gb: float = DEFAULT_PART0_RESERVE_GB
     preset: str = "auto"
     split_graphs: str = "auto"
+    split_zero: bool = False        # N=0 with endcaps/MTP on part0 (no trunk layer on part0)
 
     @property
     def enabled(self) -> bool:
-        return self.part0_layers == "auto" or (isinstance(self.part0_layers, int) and self.part0_layers > 0)
+        return (self.part0_layers == "auto"
+                or (isinstance(self.part0_layers, int) and self.part0_layers > 0)
+                or (self.split_zero and self.part0_layers == 0 and self.endcaps))
 
     @property
     def auto(self) -> bool:
@@ -99,6 +102,7 @@ class SplitSettings:
         return (f"part0_layers={self.part0_layers} part1_device={self.part1_device} "
                 f"part0_device={self.part0_device} "
                 f"endcaps={'on' if self.endcaps else 'off'} "
+                f"split_zero={'on' if self.split_zero else 'off'} "
                 f"reserve={self.part0_reserve_gb:.2f}GiB preset={self.preset} "
                 f"graphs={self.split_graphs}")
 
@@ -118,6 +122,10 @@ def add_split_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--endcaps", choices = ("on", "off"), default = None,
                         help = "with a layer split, keep allowlisted embedding/norm/lm_head/MTP/vision "
                                "modules on the part0 device (default: KYOJIN_ENDCAPS, else on)")
+    parser.add_argument("--split-zero", action = "store_true", default = None,
+                        help = "with --part0-layers 0 and --endcaps on, run a real split with only the "
+                               "endcaps/embedding/head/MTP on part0 (no trunk layer); the trunk and the expert "
+                               "tier stay on part1. Useful to put DSpark in part0 VRAM (default: KYOJIN_SPLIT_ZERO)")
     parser.add_argument("--part0-reserve-gb", type = float, default = None,
                         help = "VRAM held as a load-time slab on the part0 device for workspace; a "
                                "tuning value, not a hardware rule (default: KYOJIN_PART0_RESERVE_GB, else 1.2)")
@@ -152,6 +160,8 @@ def _split_env_base(parse_layers: bool = True) -> dict:
         part0_reserve_gb = _env_float("KYOJIN_PART0_RESERVE_GB", str(DEFAULT_PART0_RESERVE_GB)),
         preset = (os.environ.get("KYOJIN_SPLIT_PRESET", "auto") or "auto").strip().lower(),
         split_graphs = "auto",
+        split_zero = (os.environ.get("KYOJIN_SPLIT_ZERO", "0") or "0").strip().lower()
+                     not in ("", "0", "false", "no", "off"),
     )
 
 
@@ -177,6 +187,8 @@ def settings_from_namespace(args) -> SplitSettings:
         base["preset"] = args.split_preset.strip().lower()
     if getattr(args, "split_graphs", None):
         base["split_graphs"] = args.split_graphs
+    if getattr(args, "split_zero", None):
+        base["split_zero"] = True
     return SplitSettings(**base)
 
 

@@ -191,7 +191,7 @@ def load(model_dir: str, device="cuda:0", dtype=torch.float16, layers: int = Non
     log = log or (lambda s: None)
     if layers is not None and placement is not None:
         raise ValueError("pack.load: the --layers smoke subset and the layer split are mutually exclusive")
-    split = placement is not None and placement.part0_layers > 0
+    split = placement is not None and (placement.part0_layers > 0 or placement.endcaps)
     if split:
         # D6: graphs and the split's host-staged crossing never mix. Forced before the serving model reads
         # the env (DSV41Serving.__init__ captures decode_graph), regardless of the tier.

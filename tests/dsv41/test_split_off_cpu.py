@@ -71,6 +71,21 @@ def test_settings_off_paths(split_modules, monkeypatch):
     assert split.parse_part0_layers("2") == 2
 
 
+def test_split_zero_is_endcap_only(split_modules, monkeypatch):
+    """N=0 is split-off by default; the explicit split_zero flag makes it an endcap/MTP-only split."""
+    dm, bridge, split = split_modules
+    monkeypatch.delenv("KYOJIN_PART0_LAYERS", raising=False)
+    monkeypatch.delenv("KYOJIN_SPLIT_ZERO", raising=False)
+    assert split.SplitSettings(part0_layers=0).enabled is False
+    assert split.SplitSettings(part0_layers=0, split_zero=True).enabled is True
+    assert split.SplitSettings(part0_layers=0, split_zero=True, endcaps=False).enabled is False
+    assert split.SplitSettings(part0_layers=1).enabled is True
+    assert split.SplitSettings(part0_layers=0, split_zero=True, preset="ds41").enabled is True
+    monkeypatch.setenv("KYOJIN_SPLIT_ZERO", "1")
+    s = split.settings_from_env()
+    assert s.split_zero is True and s.enabled is True
+
+
 def test_apply_split_env_ds41_preset(split_modules, monkeypatch):
     dm, bridge, split = split_modules
     assert split.SPLIT_PRESETS["ds41"] == {"DSV41_DECODE_GRAPH": "0"}   # D6
