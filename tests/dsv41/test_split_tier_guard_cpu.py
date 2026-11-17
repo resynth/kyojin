@@ -94,6 +94,12 @@ class _FakeStore:
         return object()                                  # the TierSet stand-in
 
 
+def _block(config):
+    """The surface `_TierView` reads from a real DSV41Block (routed experts + routing shape)."""
+    return types.SimpleNamespace(config=config, mtp=False, pruned=None, key="layers.0", n_exp=384, topk=6,
+                                 ex_w1=[], ex_w3=[], ex_w2=[])
+
+
 def test_tier_register_respects_tier_device(modules, monkeypatch):
     """The real `_tier_register` against a stubbed store. Skips when the built extension (or numpy) is
     missing (dev box); the canary above carries the wiring contract there."""
@@ -108,16 +114,16 @@ def test_tier_register_respects_tier_device(modules, monkeypatch):
     monkeypatch.setenv("EXL3_EXPERT_BUDGET_GIB", "92")
     cfg = _t.SimpleNamespace(_expert_tier_device="cuda:1")
     fn = _M.DSV41Block._tier_register
-    front = _t.SimpleNamespace(config=cfg, mtp=False, pruned=None)
+    front = _block(cfg)
     assert fn(front, "cuda:0") is None                   # front device: no tier, no registration
     assert store.registered == []
-    back = _t.SimpleNamespace(config=cfg, mtp=False, pruned=None)
+    back = _block(cfg)
     ts = fn(back, "cuda:1")
     assert ts is not None                                # tier device registers
     assert store.device == torch.device("cuda", 1)       # the store captures the tier device
 
     cfg_off = _t.SimpleNamespace()                       # split off: the original behavior
-    any_dev = _t.SimpleNamespace(config=cfg_off, mtp=False, pruned=None)
+    any_dev = _block(cfg_off)
     assert fn(any_dev, "cuda:0") is not None
     monkeypatch.delenv("EXL3_EXPERT_BUDGET_GIB")
     assert fn(any_dev, "cuda:0") is None                 # store off entirely: still None
