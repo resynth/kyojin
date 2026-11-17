@@ -125,13 +125,22 @@ device selection, settings and bridge. Differences from the generic map:
   onto exactly one device — `part1` by default, `KYOJIN_DS41_TIER_DEVICE=part0` only on
   explicit request. Front layers never register with the store: their experts are
   resident, and the front never reads the tier.
-- **Graphs off** (`DSV41_DECODE_GRAPH=0` via the `ds41` preset), and the kernels on each
-  device are probed at load: a device where the ds41 HIP kernels cannot compile or
-  compute correctly falls back to the torch path for that device (see
-  `DSV41_SPLIT_HIP=0` to force the torch path everywhere for comparisons).
+- **Graphs off** (`DSV41_DECODE_GRAPH=0` via the `ds41` preset). The JIT modules are
+  probed **per device and per module** at load, not as one process-wide switch: on a
+  `gfx12` `part0` the decode chain, fused glue and JIT MoE (`dsv41_hip`, `dsv41_fuse`,
+  `dsv41_moe`) build and run there, while the WMMA prompt-attention and indexer modules
+  (`ds41_pf`, `dsv41_idx`) cannot compile and take their torch fallbacks on that device
+  only. The iGPU keeps every fast path. `DSV41_SPLIT_HIP=0` disables every module on
+  every split device, for A/B against the torch path.
 - **Bounded bridge staging.** A 32K `part0`→`part1` crossing is a 2.69 GB fp32 tensor;
   `hop_chunk` slices such crossings so the pinned staging stays near
   `KYOJIN_BRIDGE_CHUNK_MB` (default 256 MiB) ×2 slots instead of two full chunks.
+- **What fits a 16 GiB front.** `N=1` with endcaps on fits with headroom and is the
+  measured setting: decode is faster than split-off and prefill is at parity (the
+  row-blocked torch prompt pass keeps the 32K single chunk on the card). `N=2` does not
+  fit with the endcaps on the front, and DSpark does not fit next to layer 0 + endcaps;
+  for MTP use `--endcaps off` (the head and the MTP stages move to `part1`, the front
+  keeps layer 0) or a front card with more memory.
 
 Example (the working orientation is the small card as `part0`):
 
