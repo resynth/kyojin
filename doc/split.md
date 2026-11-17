@@ -137,12 +137,14 @@ device selection, settings and bridge. Differences from the generic map:
   `KYOJIN_BRIDGE_CHUNK_MB` (default 256 MiB) ×2 slots instead of two full chunks.
 - **What fits a 16 GiB front.** `N=1` with endcaps on fits with headroom and is the measured
   setting: decode is faster than split-off and prefill is at parity (the row-blocked torch
-  prompt pass keeps the 32K single chunk on the card). The split does **not** buy a larger
-  expert pool: the ~5 GiB of weights it moves to VRAM are offset by the second device's
-  host-side state (pinned staging, its HIP context), so budget the same pool as
-  single-device. `N=2` does not fit at 32K (with or without the endcaps on the front), and
-  DSpark does not fit next to layer 0 + endcaps; for MTP use `--endcaps off` (the head and
-  the MTP stages move to `part1`, the front keeps layer 0) or a front card with more memory.
+  prompt pass keeps the 32K single chunk on the card). A 94 GiB expert pool is the best
+  all-round budget (32K and 128K both safe); the split does **not** buy a materially larger
+  pool: the ~5 GiB of weights it moves to VRAM are largely offset by the bridge's pinned
+  staging and per-device state. The gain grows with context (decode +5 % at 32K, +9 % at
+  128K against split-off at the same/best pool), while a cold 128K prefill costs ~5 % extra.
+  `N=2` does not fit at 32K (with or without the endcaps on the front), and DSpark does not
+  fit next to layer 0 + endcaps; for MTP use `--endcaps off` (the head and the MTP stages
+  move to `part1`, the front keeps layer 0) or a front card with more memory.
 
 Example (the working orientation is the small card as `part0`):
 
