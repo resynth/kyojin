@@ -165,10 +165,10 @@ def _bind_src(src, mod, text_mtp) -> str:
         src.norm = mod.w
     elif key == "head":
         src.lins["head"] = PackLin(mod.head)
-    elif key.startswith("layers.") or key.startswith("mtp."):
-        src.add_block(mod)
     elif key == "mtp.extra":
         src.add_extra(mod, text_mtp.main_proj)
+    elif key.startswith("layers.") or key.startswith("mtp."):
+        src.add_block(mod)
     return key
 
 
@@ -282,11 +282,6 @@ def load(model_dir: str, device="cuda:0", dtype=torch.float16, layers: int = Non
             log(f"loaded {key} on {dv}")
             if key.startswith("layers."):
                 blocks.append(mod)
-                blocks.append(mod)
-            elif key == "mtp.extra":
-                src.add_extra(mod, text_mtp.main_proj)
-            elif key.startswith("mtp."):
-                src.add_block(mod)                    # MTP blocks are picked up through mtp_mod below, like single-device
         slab = None
         mtp_mod = text_mtp
     else:
