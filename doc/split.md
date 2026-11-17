@@ -149,6 +149,16 @@ device selection, settings and bridge. Differences from the generic map:
   absolute maximum, not a serving config. DSpark does not fit next to layer 0 + endcaps on a
   16 GiB front even without the load guard; for MTP use `--endcaps off` (the head and the MTP
   stages move to `part1`, the front keeps layer 0) or a front card with more memory.
+- **Endcap-only split (`--split-zero`).** With `--part0-layers 0 --split-zero` and endcaps on,
+  embed/norm/head **and the DSpark stages** move to `part0`, while the whole trunk and the
+  expert tier stay on `part1`. This is the MTP config: DSpark runs in the 9070's VRAM instead
+  of costing ~7 GiB of host, so pool 88 is comfortable (floor 15 GiB) and tool/agentic decode
+  is **22.2 vs 20.1 t/s** for split-off DSpark (+10 %), prefill 483 t/s. Plain decode in this
+  mode is **token-identical** to split-off (greedy hash match), with prefill at/above split-off
+  (32K 458.6, 128K 448.4 vs the N=1 split's 431.7/417.9) and decode 11.15/10.70 at 32K/128K
+  (below N=1's 11.96/11.23). Use it for prefill-heavy or exactness-critical plain work; keep
+  the N=1 split when decode is the priority. Prose and code MTP still lose (the front drafter's
+  acceptance is lower), so keep them plain.
 
 Example (the working orientation is the small card as `part0`):
 
