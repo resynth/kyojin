@@ -24,7 +24,9 @@ from . import ops, dec2
 
 def hip_available(device, dim: int, hc: int) -> bool:
     """HIP kernels are usable: a CUDA/HIP device (or the CPU emulator of the tests), real dims."""
-    if os.environ.get("DSV41_KERNELS", "1") == "0" or dim != 5120 or hc != 4:
+    from ..modules.dsv41_fn import kernel_state
+    if (os.environ.get("DSV41_KERNELS", "1") == "0" or dim != 5120 or hc != 4
+            or kernel_state.disabled(device, "dsv41_hip")):
         return False
     try:
         from ..modules.dsv41_fn import dsv41_hip as K
@@ -36,14 +38,13 @@ def hip_available(device, dim: int, hc: int) -> bool:
 
 
 def probe_hip(device, logger=print) -> bool:
-    """Split-mode guard: does the ds41kern kernel chain run *correct* small ops on `device`?
+    """Split-mode guard for the **decode chain** (dsv41_hip): does it run *correct* small ops on `device`?
 
-    ``dsv41_hip.hip`` documents gfx1151; the fused-KDA port also builds dsv41_idx / dsv41_fuse for gfx12.
-    Any other architecture is untested territory. ``hip_available`` only checks "CUDA/HIP", so a device the
-    kernels were never built for would silently run the wrong ISA or mis-compute. This probe compiles and
-    launches rmsnorm_rows on the device and checks it against the torch reference, so a failed compile AND a
-    silent mis-compile both fall back to the torch path for that device. ``DSV41_SPLIT_HIP=0`` force-disables
-    the kernels on every split device (box comparisons of the two paths).
+    ``dsv41_hip.hip`` documents gfx1151 and ``hip_available`` only checks "CUDA/HIP", so a device the
+    kernels were never built for could silently run the wrong ISA or mis-compute. This probe compiles and
+    launches rmsnorm_rows on the device and checks it against the torch reference, so a failed compile AND
+    a silent mis-compile both take the torch path for that device. The other JIT modules are probed by
+    ``probe_ds41_kernels`` (per module, same idea); ``DSV41_SPLIT_HIP=0`` disables them all on split devices.
     """
     if os.environ.get("DSV41_SPLIT_HIP", "1") == "0":
         return False
@@ -65,6 +66,51 @@ def probe_hip(device, logger=print) -> bool:
         logger(f"[split] ds41 HIP probe failed on {dv}: {ex!r}")
         return False
     return True
+
+
+def probe_ds41_kernels(device, logger=print) -> bool:
+    """Split-mode gate for the DS4.1 JIT modules on `device`, decided once at load, **per module**.
+
+    Each module compiles for the device's arch on first use, and the sources target gfx1151 WMMA opcodes.
+    A failing module is disabled on that device only (`dsv41_fn.kernel_state`) and its consumers take the
+    fallback; the modules that do work there keep running. On gfx1201 that is exactly what happens: the
+    decode chain (dsv41_hip), the fused glue (dsv41_fuse) and the JIT MoE (dsv41_moe) build, while the
+    WMMA prompt attention (ds41_pf) and the WMMA indexer scoring (dsv41_idx) do not — so the front card
+    still gets the fast decoder/glue/MoE and only its prompt attention and indexer scoring fall back.
+    `DSV41_SPLIT_HIP=0` disables every module on every split device (box A/B of the two paths).
+
+    Returns whether dsv41_hip (the decode chain) is usable: that is what selects HipHC/the fast decode
+    path in the serving model. The other results only feed the registry.
+    """
+    dv = torch.device(device)
+    from ..modules.dsv41_fn import kernel_state
+    if os.environ.get("DSV41_SPLIT_HIP", "1") == "0":
+        for name in kernel_state.MODULES:
+            kernel_state.disable(dv, name)
+        logger(f"[split] DSV41_SPLIT_HIP=0: ds41 JIT modules disabled on {dv}")
+        return False
+    if dv.type != "cuda" or not torch.cuda.is_available():
+        return True                       # the CPU emulator of the tests keeps its own gates
+    ok = {"dsv41_hip": probe_hip(dv, logger)}      # numerics check (rmsnorm vs the torch reference)
+    from ..modules.dsv41_fn import ds41_pf, dsv41_idx, dsv41_fuse, dsv41_moe
+    probes = (("ds41_pf", lambda: ds41_pf._fn("ds41_rope_rows", dv)),
+              ("dsv41_idx", lambda: dsv41_idx._load(dv)),
+              ("dsv41_fuse", lambda: dsv41_fuse._load(dv)),
+              ("dsv41_moe", lambda: dsv41_moe._load(dv)))
+    for name, fn in probes:
+        try:
+            fn()
+            ok[name] = True
+        except Exception as ex:                            # noqa: BLE001 - arch/toolchain failure
+            ok[name] = False
+            logger(f"[split] ds41 {name} kernels unavailable on {dv}: {str(ex).splitlines()[0][:300]}")
+    for name, good in ok.items():
+        if not good:
+            kernel_state.disable(dv, name)
+    bad = sorted(n for n, good in ok.items() if not good)
+    if bad:
+        logger(f"[split] ds41 JIT modules disabled on {dv}: {', '.join(bad)}")
+    return ok["dsv41_hip"]
 
 
 class TorchHC:

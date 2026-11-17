@@ -52,6 +52,9 @@ def _fn(name, device=None):
 
 def _launch(name, grid, block, args):
     device = next((a.device for a in args if isinstance(a, torch.Tensor)), None)
+    from . import kernel_state
+    if device is not None and kernel_state.disabled(device, "ds41_pf"):
+        raise RuntimeError(f"ds41_pf: kernels disabled on {device} (probe fallback); a caller missed a gate")
     fn = _fn(name, device)
     cargs = []
     for a in args:
@@ -89,7 +92,9 @@ def rope_rows(x, fc32, pos, heads, inverse=False):
 
 
 def usable(q, kv, idx, sink) -> bool:
-    return (os.environ.get("DSV41_KERNELS", "1") != "0" and q.is_cuda and q.dtype == kv.dtype == torch.half
+    from . import kernel_state
+    return (os.environ.get("DSV41_KERNELS", "1") != "0" and not kernel_state.disabled(q.device, "ds41_pf")
+            and q.is_cuda and q.dtype == kv.dtype == torch.half
             and q.dim() == 4 and q.size(0) == 1 and q.size(2) == 64 and q.size(3) == 512 and q.size(1) > 1
             and kv.dim() == 3 and kv.size(2) == 512 and sink.numel() == 64)
 

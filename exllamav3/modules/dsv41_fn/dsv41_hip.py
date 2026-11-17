@@ -78,6 +78,9 @@ def _pack(args):
 
 
 def _go(name, g, block, params, device=None):
+    from . import kernel_state
+    if device is not None and kernel_state.disabled(device, "dsv41_hip"):
+        raise RuntimeError(f"dsv41_hip: kernels disabled on {device} (probe fallback); a caller missed a gate")
     emu = _state.get("emu")          # tests only: CPU emulation of the kernel model (tests/dsv41/hipemu), CPU tensors
     if emu:
         return emu(name, g, block, params)

@@ -245,3 +245,25 @@ def test_env_snapshot_restore_roundtrip(split_modules, monkeypatch):
     ds41_model._restore_split_env()
     assert "KYOJIN_SPLIT_ACTIVE" not in os.environ
     sys.path.remove(str(ROOT / "tools" / "ds41"))
+
+
+def test_kernel_state_registry(split_modules):
+    """Per-device DS4.1 JIT disable registry (the split's mixed-arch fallback): the decision is per device,
+    so the 9070 can run torch paths while the iGPU keeps its kernels."""
+    ks = _load_module("exllamav3.modules.dsv41_fn.kernel_state",
+                      ROOT / "exllamav3" / "modules" / "dsv41_fn" / "kernel_state.py")
+    ks.clear()
+    assert not ks.disabled("cuda:0", "ds41_pf") and not ks.disabled(torch.device("cuda", 1), "dsv41_hip")
+    ks.disable("cuda:1", "ds41_pf")
+    assert ks.disabled("cuda:1", "ds41_pf") and ks.disabled(torch.device("cuda", 1), "ds41_pf")
+    assert not ks.disabled("cuda:1", "dsv41_hip")        # module-local: the decode chain still runs
+    assert not ks.disabled("cuda:0", "ds41_pf")          # device-local: the other card keeps its kernels
+    ks.disable("cuda:1", "dsv41_idx")
+    assert ks.disabled("cuda:1", "dsv41_idx") and ks.disabled("cuda:1", "ds41_pf")
+    with pytest.raises(AssertionError):
+        ks.disable("cuda:1", "not_a_ds41_module")
+    ks.clear()
+    assert not ks.disabled("cuda:1", "ds41_pf")
+    with pytest.raises(AssertionError):
+        ks.disabled("cuda:1", "nope")
+    sys.modules.pop("exllamav3.modules.dsv41_fn.kernel_state", None)

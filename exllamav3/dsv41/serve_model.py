@@ -32,7 +32,7 @@ from .vision import span_mask, splice
 from . import dec2
 from .serve_ops import make_hc, Router
 from .linear import DenseLin
-from .serve_ops import HipDense, TorchHC, probe_hip
+from .serve_ops import HipDense, TorchHC, probe_ds41_kernels
 from .serve_moe import LoopMoE, GroupedMoE
 
 
@@ -92,11 +92,13 @@ class DSV41Serving(DSV41Model):
             fast = self._fast_attn_available(cfg, dtype, dv)
             hc_dev = make_hc(cfg, dt, dv)
             use_hip = None                           # split off: the router decides from hip_available, as before
-            if fast and placement is not None:
-                if os.environ.get("DSV41_SPLIT_HIP", "1") == "0" or not probe_hip(dv):
-                    print(f"[split] ds41 HIP kernels unusable on {dv}: torch path on this device", flush=True)
+            if placement is not None:
+                # one probe per split device, per JIT module (decode chain, prompt attention, indexer,
+                # fused glue, JIT MoE); the return is the decode chain's verdict, which selects HipHC and
+                # the fast decode path. Failing modules take their fallbacks on that device only.
+                if not probe_ds41_kernels(dv):
                     fast = False
-                    hc_dev = TorchHC(cfg, dt)        # the probe vets the whole kernel chain on a split device
+                    hc_dev = TorchHC(cfg, dt)
             if placement is not None and not fast:
                 use_hip = False                      # a split device without (probed) kernels: torch router
             self._fast[str(dv)] = fast
@@ -492,8 +494,9 @@ class DSV41Serving(DSV41Model):
     # ---- prompt-chunk fast paths (HIP kernels; short blocks keep the torch ops so decode / verify numerics are unchanged)
     @staticmethod
     def _pffast(x):
+        from ..modules.dsv41_fn import kernel_state
         return (x.is_cuda and x.dtype == torch.half and x.size(0) == 1 and x.size(1) >= PF_ATTN_MIN_ROWS
-                and os.environ.get("DSV41_KERNELS", "1") != "0")
+                and os.environ.get("DSV41_KERNELS", "1") != "0" and not kernel_state.disabled(x.device, "ds41_pf"))
 
     def _pfrms(self, fast, x, w):
         if not fast or x.size(-1) % 32 or not x.is_contiguous() or w.dtype != torch.float:
@@ -552,9 +555,12 @@ class DSV41Serving(DSV41Model):
             window_kv = None
         else:
             qr = self._pfrms(pf, w.wq_a(x), w.q_norm)
-            if (pf and B == 1 and L > self.pf_attn_rows and st.win[l].dtype == torch.half and H == 64 and hd == 512
+            if (B == 1 and L > self.pf_attn_rows and st.win[l].dtype == torch.half and H == 64 and hd == 512
                     and w.sink.numel() == 64):
-                q = None            # projected, roped and consumed block by block below: [L, 64 * 512] never exists
+                # projected, roped and consumed block by block below: [L, 64 * 512] never exists. Torch blocks
+                # too: on a split's small front card (no ds41_pf kernels there) a 32K chunk's q alone would
+                # be 2 GiB on a 16 GiB device.
+                q = None
             else:
                 q = w.wq_b(qr).unflatten(-1, (H, hd))
                 self._pfrope(pf, q, fc, qpos, H)
@@ -629,13 +635,22 @@ class DSV41Serving(DSV41Model):
         elif q is None:
             # long prompt chunk: q, the attention output and the grouped output projection run on row blocks (rows are
             # independent: the same arithmetic as the whole chunk at once, without its two [L, 32768] fp16 buffers)
-            kvc = kv_all if kv_pool is None or kv_pool.size(1) == 0 else torch.cat([kv_all, kv_pool], dim=1)
+            kvc = (kv_all if kv_pool is None or kv_pool.size(1) == 0 else torch.cat([kv_all, kv_pool], dim=1)) if pf else None
+            # the pf kernel takes a whole block; the torch path keeps its smaller inner attention blocks so the
+            # per-block score buffers stay small (the front card is 16 GiB)
+            rows_per_block = self.pf_attn_rows if pf else min(self.pf_attn_rows, 4096)
             ys = []
-            for a, b in self._row_blocks(L, self.pf_attn_rows):
-                pos = lambda: (self._pftab(fc_t), torch.arange(start_pos + a, start_pos + b, dtype=torch.int32, device=x.device))
+            for a, b in self._row_blocks(L, rows_per_block):
+                pos = lambda a=a, b=b: (self._pftab(fc_t), torch.arange(start_pos + a, start_pos + b, dtype=torch.int32, device=x.device))
                 qb = w.wq_b(qr[:, a:b]).unflatten(-1, (H, hd))
                 self._pfrope(pf, qb, fc[a:b], pos, H)
-                ob = _pf.sparse_attention(qb, kvc, w.sink, idxs[:, a:b], sc)
+                if pf:
+                    ob = _pf.sparse_attention(qb, kvc, w.sink, idxs[:, a:b], sc)
+                else:
+                    ob = torch.empty_like(qb)
+                    for c in range(0, b - a, self.attn_block):
+                        d = min(b - a, c + self.attn_block)
+                        ob[:, c:d] = ops.sparse_attention(qb[:, c:d], kv_all, w.sink, idxs[:, a + c:a + d], sc, kv_pool)
                 del qb
                 self._pfrope(pf, ob, fc[a:b], pos, H, True)
                 ob = ob.view(B, b - a, G, -1)

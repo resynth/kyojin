@@ -35,6 +35,15 @@ except Exception:     # no HIP stack (CPU checks)
     _pf = None
 import torch
 from . import Linear
+
+
+def _pf_off(device) -> bool:
+    """A split device without the gfx1151-only ds41_pf kernels (kernel_state registry)."""
+    try:
+        from .dsv41_fn import kernel_state
+        return kernel_state.disabled(device, "ds41_pf")
+    except Exception:
+        return False
 from .multilinear import MultiLinear
 
 DECODE_K = (1, 2, 2.5, 3, 4, 5, 6)
@@ -308,7 +317,7 @@ class MixedKStore:
         # slot-order reduction of each token's picks (the kernel's own reduce order); pruned picks (bucket G) add nothing
         inv = torch.full((T * top_k,), -1, dtype = torch.int32, device = dev)
         inv[perm[:n_valid]] = torch.arange(n_valid, dtype = torch.int32, device = dev)
-        if _pf is not None and res_all.is_cuda and hidden % 4 == 0:
+        if _pf is not None and res_all.is_cuda and hidden % 4 == 0 and not _pf_off(res_all.device):
             _pf.gather_sum(res_all, inv, out, T, top_k, hidden)
         else:
             contrib = torch.zeros((T * top_k, hidden), dtype = torch.float, device = dev)

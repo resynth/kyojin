@@ -12,7 +12,8 @@ _state = {}
 
 
 def available(device) -> bool:
-    if os.environ.get("DSV41_IDX_KERNELS", "1") == "0":
+    from . import kernel_state
+    if os.environ.get("DSV41_IDX_KERNELS", "1") == "0" or kernel_state.disabled(device, "dsv41_idx"):
         return False
     return torch.device(device).type == "cuda" and torch.cuda.is_available() and torch.version.hip is not None
 

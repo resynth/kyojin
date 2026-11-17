@@ -61,6 +61,9 @@ def _hip_fq(x: torch.Tensor, mode: int, block: int) -> bool:
     if not x.is_contiguous():
         return False
     from ..modules.dsv41_fn import dsv41_hip as K
+    from ..modules.dsv41_fn import kernel_state
+    if kernel_state.disabled(x.device, "dsv41_hip"):
+        return False
     K.fq_rows(x, mode)
     return True
 
