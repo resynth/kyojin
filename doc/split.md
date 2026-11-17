@@ -135,12 +135,14 @@ device selection, settings and bridge. Differences from the generic map:
 - **Bounded bridge staging.** A 32K `part0`→`part1` crossing is a 2.69 GB fp32 tensor;
   `hop_chunk` slices such crossings so the pinned staging stays near
   `KYOJIN_BRIDGE_CHUNK_MB` (default 256 MiB) ×2 slots instead of two full chunks.
-- **What fits a 16 GiB front.** `N=1` with endcaps on fits with headroom and is the
-  measured setting: decode is faster than split-off and prefill is at parity (the
-  row-blocked torch prompt pass keeps the 32K single chunk on the card). `N=2` does not
-  fit with the endcaps on the front, and DSpark does not fit next to layer 0 + endcaps;
-  for MTP use `--endcaps off` (the head and the MTP stages move to `part1`, the front
-  keeps layer 0) or a front card with more memory.
+- **What fits a 16 GiB front.** `N=1` with endcaps on fits with headroom and is the measured
+  setting: decode is faster than split-off and prefill is at parity (the row-blocked torch
+  prompt pass keeps the 32K single chunk on the card). The split does **not** buy a larger
+  expert pool: the ~5 GiB of weights it moves to VRAM are offset by the second device's
+  host-side state (pinned staging, its HIP context), so budget the same pool as
+  single-device. `N=2` does not fit at 32K (with or without the endcaps on the front), and
+  DSpark does not fit next to layer 0 + endcaps; for MTP use `--endcaps off` (the head and
+  the MTP stages move to `part1`, the front keeps layer 0) or a front card with more memory.
 
 Example (the working orientation is the small card as `part0`):
 
