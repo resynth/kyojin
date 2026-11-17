@@ -110,7 +110,7 @@ class PortTarget:
         s.st, s.length, s.block, s.keys_run = pf.st, len(tokens), None, list(keys)
         s.keys = None
         s.cached, s.miss_lcp = pf.cached, pf.lcp
-        s.rows = pf.hidden.to(self.draft_device) if pf.hidden is not None else None
+        s.rows = pf.hidden.to(s.draft_device) if pf.hidden is not None else None
         s.drafter._next = len(tokens) - (s.rows.size(0) if s.rows is not None else 0)
         return BlockOut(logits=pf.logits, hidden=s.rows)
 
@@ -125,8 +125,8 @@ class PortTarget:
         logits, hidden = s.model.forward_block(ids, start_pos, s.st)
         s.length, s.block = start_pos + n, (start_pos, n)
         if s.rows is not None:
-            s.rows = torch.cat([s.rows, hidden[0].to(self.draft_device)], dim=0)[-s.model.cfg.sliding_window:]
-        return BlockOut(logits=logits[0], hidden=hidden[0].to(self.draft_device))
+            s.rows = torch.cat([s.rows, hidden[0].to(s.draft_device)], dim=0)[-s.model.cfg.sliding_window:]
+        return BlockOut(logits=logits[0], hidden=hidden[0].to(s.draft_device))
 
     def truncate(self, length: int) -> None:
         s = self.s
