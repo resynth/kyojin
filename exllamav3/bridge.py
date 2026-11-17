@@ -58,7 +58,13 @@ class Bridge:
         self.part1 = torch.device(part1)
         self.part0 = torch.device(part0)
         if max_chunk_bytes is None:
-            max_chunk_bytes = int(float(os.environ.get("KYOJIN_BRIDGE_CHUNK_MB", "256")) * (1 << 20))
+            try:
+                max_chunk_bytes = int(float(os.environ.get("KYOJIN_BRIDGE_CHUNK_MB", "256")) * (1 << 20))
+            except (TypeError, ValueError):
+                print(f"[bridge] could not parse KYOJIN_BRIDGE_CHUNK_MB="
+                      f"{os.environ.get('KYOJIN_BRIDGE_CHUNK_MB')!r}; using the 256 MiB default "
+                      "(a plain byte/MB integer; 0 means unbounded staging)", flush = True)
+                max_chunk_bytes = int(256 * (1 << 20))
         # 0 = unbounded staging (the pre-split behavior); everything else keeps a prefill-sized crossing's
         # pinned slot at or below this many bytes by slicing it (see hop_chunk).
         self.max_chunk_bytes = max(0, int(max_chunk_bytes))
@@ -112,8 +118,9 @@ class Bridge:
             cur = torch.cuda.current_stream(dst)
             with torch.cuda.stream(cur):
                 for a, b in slices:
-                    got = self._hop(src_flat[a:b], dst, chunk = True)
-                    dst_flat[a:b].copy_(got, non_blocking = True)   # ordered after this slice's H2D
+                    # the slice's H2D writes the preallocated region directly: no per-slice temp, no extra
+                    # full-tensor D2D copy on the destination device
+                    self._hop(src_flat[a:b], dst, chunk = True, out = dst_flat[a:b])
         return out
 
     # -- implementation ----------------------------------------------------
@@ -166,7 +173,7 @@ class Bridge:
             slot.read = torch.cuda.Event()
         self.stats["reallocs"] += 1
 
-    def _hop(self, t: torch.Tensor, dst: torch.device, chunk: bool) -> torch.Tensor:
+    def _hop(self, t: torch.Tensor, dst: torch.device, chunk: bool, out: torch.Tensor | None = None) -> torch.Tensor:
         dst = torch.device(dst)
         if t.device == dst:
             return t
@@ -202,7 +209,12 @@ class Bridge:
 
         with torch.cuda.device(dst), torch.cuda.stream(dst_stream):
             dst_stream.wait_event(slot.filled)
-            out = hb.to(dst, non_blocking = True)
+            if out is None:
+                out = hb.to(dst, non_blocking = True)
+            else:
+                # caller-provided destination region (the sliced hop): the H2D lands in it directly;
+                # `out` must be a contiguous view of a tensor on `dst` with t's shape
+                out.copy_(hb, non_blocking = True)
             slot.read.record(dst_stream)
         slot.read_valid = True
 

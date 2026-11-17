@@ -127,43 +127,57 @@ def add_split_arguments(parser: argparse.ArgumentParser) -> None:
                         help = "per-segment graphs (Stage 6); auto forces graphs off for now")
 
 
-def settings_from_namespace(args) -> SplitSettings:
-    raw = getattr(args, "part0_layers", None)
+def _env_float(name: str, default: str) -> float:
+    """Env float with a domain message instead of a raw ValueError; `default` is the documented fallback."""
+    raw = os.environ.get(name)
     if raw is None:
-        raw = os.environ.get("KYOJIN_PART0_LAYERS", "0")
-    endcaps = getattr(args, "endcaps", None)
-    if endcaps is None:
-        endcaps = os.environ.get("KYOJIN_ENDCAPS", "1") != "0"
-    else:
-        endcaps = endcaps == "on"
-    preset = getattr(args, "split_preset", None) or os.environ.get("KYOJIN_SPLIT_PRESET", "auto")
-    graphs = getattr(args, "split_graphs", None) or "auto"
-    reserve = getattr(args, "part0_reserve_gb", None)
-    if reserve is None:
-        reserve = float(os.environ.get("KYOJIN_PART0_RESERVE_GB", str(DEFAULT_PART0_RESERVE_GB)))
-    return SplitSettings(
-        part0_layers = parse_part0_layers(raw),
-        part1_device = getattr(args, "part1_device", None) or os.environ.get("KYOJIN_PART1_DEVICE") or "auto",
-        part0_device = getattr(args, "part0_device", None) or os.environ.get("KYOJIN_PART0_DEVICE") or "auto",
-        endcaps = bool(endcaps),
-        part0_reserve_gb = float(reserve),
-        preset = (preset or "auto").strip().lower(),
-        split_graphs = graphs,
+        return float(default)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        print(f"[split] could not parse {name}={raw!r}; using {default}", flush = True)
+        return float(default)
+
+
+def _split_env_base(parse_layers: bool = True) -> dict:
+    """The env fallbacks of the split contract, shared by the CLI namespace path and the env-only path so a
+    key or default added to one parser stays in both. `parse_layers=False` skips the KYOJIN_PART0_LAYERS
+    parse for callers that override it from an explicit argument (a malformed env value must not reject a
+    CLI run that names N itself)."""
+    return dict(
+        part0_layers = parse_part0_layers(os.environ.get("KYOJIN_PART0_LAYERS", "0")) if parse_layers else 0,
+        part0_device = os.environ.get("KYOJIN_PART0_DEVICE") or "auto",
+        part1_device = os.environ.get("KYOJIN_PART1_DEVICE") or "auto",
+        endcaps = os.environ.get("KYOJIN_ENDCAPS", "1") != "0",
+        part0_reserve_gb = _env_float("KYOJIN_PART0_RESERVE_GB", str(DEFAULT_PART0_RESERVE_GB)),
+        preset = (os.environ.get("KYOJIN_SPLIT_PRESET", "auto") or "auto").strip().lower(),
+        split_graphs = "auto",
     )
 
 
 def settings_from_env() -> SplitSettings:
-    """SplitSettings from the environment only, for loaders (harnesses,ds41_model.load_model) that are
+    """SplitSettings from the environment only, for loaders (harnesses, ds41_model.load_model) that are
     called without the server CLI. Same env keys settings_from_namespace falls back to."""
-    return SplitSettings(
-        part0_layers = parse_part0_layers(os.environ.get("KYOJIN_PART0_LAYERS", "0")),
-        part1_device = os.environ.get("KYOJIN_PART1_DEVICE") or "auto",
-        part0_device = os.environ.get("KYOJIN_PART0_DEVICE") or "auto",
-        endcaps = os.environ.get("KYOJIN_ENDCAPS", "1") != "0",
-        part0_reserve_gb = float(os.environ.get("KYOJIN_PART0_RESERVE_GB", str(DEFAULT_PART0_RESERVE_GB))),
-        preset = (os.environ.get("KYOJIN_SPLIT_PRESET", "auto") or "auto").strip().lower(),
-        split_graphs = "auto",
-    )
+    return SplitSettings(**_split_env_base())
+
+
+def settings_from_namespace(args) -> SplitSettings:
+    base = _split_env_base(parse_layers = getattr(args, "part0_layers", None) is None)
+    if getattr(args, "part0_layers", None) is not None:
+        base["part0_layers"] = parse_part0_layers(args.part0_layers)
+    if getattr(args, "part0_device", None):
+        base["part0_device"] = args.part0_device
+    if getattr(args, "part1_device", None):
+        base["part1_device"] = args.part1_device
+    if getattr(args, "endcaps", None) is not None:
+        base["endcaps"] = args.endcaps == "on"
+    if getattr(args, "part0_reserve_gb", None) is not None:
+        base["part0_reserve_gb"] = float(args.part0_reserve_gb)
+    if getattr(args, "split_preset", None):
+        base["preset"] = args.split_preset.strip().lower()
+    if getattr(args, "split_graphs", None):
+        base["split_graphs"] = args.split_graphs
+    return SplitSettings(**base)
 
 
 def apply_split_env(settings: SplitSettings, logger = print) -> list[str]:

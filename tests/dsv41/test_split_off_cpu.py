@@ -170,3 +170,78 @@ def test_hop_same_device_noop(split_modules):
     assert b.hop_chunk(t, torch.device("cpu")) is t
     assert b.stats["chunk_hops"] == 0 and b.stats["hops"] == 0
     assert t.device.type == "cpu"
+
+
+def test_bridge_env_parse_falls_back(split_modules, monkeypatch, capsys):
+    dm, bridge, split = split_modules
+    monkeypatch.setenv("KYOJIN_BRIDGE_CHUNK_MB", "abc")
+    b = bridge.Bridge(part1=torch.device("cuda", 0), part0=torch.device("cuda", 1))
+    assert b.max_chunk_bytes == 256 * (1 << 20)                # documented default, load instead of crash
+    assert "could not parse" in capsys.readouterr().out
+    monkeypatch.setenv("KYOJIN_BRIDGE_CHUNK_MB", "1.5")
+    assert bridge.Bridge(part1=torch.device("cuda", 0), part0=torch.device("cuda", 1)).max_chunk_bytes \
+        == int(1.5 * (1 << 20))                                # a plain MiB value is honored
+
+
+def test_settings_from_env_guarded_float(split_modules, monkeypatch, capsys):
+    dm, bridge, split = split_modules
+    monkeypatch.setenv("KYOJIN_PART0_RESERVE_GB", "nonsense")
+    s = split.settings_from_env()
+    assert s.part0_reserve_gb == 1.2                           # DEFAULT_PART0_RESERVE_GB, warned above
+    assert "could not parse" in capsys.readouterr().out
+
+
+def test_shared_env_builder_matches_namespace(split_modules, monkeypatch):
+    """settings_from_env and the env fallbacks of settings_from_namespace must stay one contract."""
+    dm, bridge, split = split_modules
+    monkeypatch.setenv("KYOJIN_PART0_LAYERS", "2")
+    monkeypatch.setenv("KYOJIN_PART0_DEVICE", "cuda:1")
+    monkeypatch.setenv("KYOJIN_PART1_DEVICE", "cuda:0")
+    monkeypatch.setenv("KYOJIN_ENDCAPS", "0")
+    monkeypatch.setenv("KYOJIN_SPLIT_PRESET", "DS41")
+    s_env = split.settings_from_env()
+
+    class _Args:                                               # the CLI with every flag unset
+        pass
+
+    s_ns = split.settings_from_namespace(_Args())
+    assert vars(s_env) == vars(s_ns)
+    assert s_env.part0_layers == 2 and s_env.part0_device == "cuda:1" and s_env.part1_device == "cuda:0"
+    assert s_env.endcaps is False and s_env.preset == "ds41"   # preset normalized the same way
+
+    _Args.part0_layers = "3"                                   # an explicit N wins, even with env set
+    s_ns2 = split.settings_from_namespace(_Args)
+    assert s_ns2.part0_layers == 3 and vars(s_ns2)["part0_device"] == "cuda:1"
+
+
+def test_env_snapshot_restore_roundtrip(split_modules, monkeypatch):
+    """A split-off load must see exactly the pre-split env (and device_copy.FORCED), so harness A/B in one
+    process keeps the single-device contract."""
+    dm, bridge, split = split_modules
+    sys.path.insert(0, str(ROOT / "tools" / "ds41"))
+    try:
+        import ds41_model
+    except Exception as ex:                              # noqa: BLE001 - loader module optional deps
+        pytest.skip(f"ds41_model import needs its optional deps ({ex!r})")
+    monkeypatch.delenv("KYOJIN_SPLIT_ACTIVE", raising=False)
+    monkeypatch.setenv("KYOJIN_PART0_LAYERS", "0")
+    ds41_model._restore_split_env()                            # nothing to undo: a no-op
+    ds41_model._snapshot_split_env()
+    before = {k: os.environ.get(k) for k in ds41_model._split_forced_keys()}
+    import exllamav3.util.device_copy as dc
+    before["dc.FORCED"] = dc.FORCED
+    # a split-on run forces keys and flips the device_copy flag
+    os.environ["KYOJIN_SPLIT_ACTIVE"] = "1"
+    os.environ["DSV41_DECODE_GRAPH"] = "0"
+    os.environ["EXL3_BLOCK_GRAPH"] = "0"
+    dc.FORCED = True
+    ds41_model._restore_split_env()
+    assert os.environ.get("KYOJIN_SPLIT_ACTIVE") == before["KYOJIN_SPLIT_ACTIVE"]
+    assert dc.FORCED == before["dc.FORCED"]
+    assert ds41_model._SPLIT_ENV_DONE is False                 # a later split-on load applies fresh
+    # ...and re-arming the marker state is coherent: snapshot again, mutate, restore
+    ds41_model._snapshot_split_env()
+    os.environ["KYOJIN_SPLIT_ACTIVE"] = "1"
+    ds41_model._restore_split_env()
+    assert "KYOJIN_SPLIT_ACTIVE" not in os.environ
+    sys.path.remove(str(ROOT / "tools" / "ds41"))

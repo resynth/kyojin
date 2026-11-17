@@ -457,8 +457,8 @@ def engram_inject(h: torch.Tensor, hash_ids: torch.Tensor, store: EngramRowStore
     wkv: callable [.., n_cols*256] -> [.., dim*(hc+1)] ; qk_weight = q_weight*k_weight [hc, dim]."""
     B, L, nc = hash_ids.shape
     if hash_ids.device != h.device:
-        # a split: the hasher (and its history) live on the home device, the engram layer may sit on the
-        # other one. torch.unique must run beside the gather it feeds; the ids are [B, L, n_cols] int64.
+        # a split normally hops the ids through the bridge (serve_model._engram_rows); this .to() only
+        # catches direct callers. torch.unique must run beside the gather it feeds ([B, L, n_cols] int64).
         hash_ids = hash_ids.to(h.device)
     flat = hash_ids.reshape(-1)
     uniq, inv = torch.unique(flat, return_inverse=True)

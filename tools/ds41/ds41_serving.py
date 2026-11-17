@@ -53,7 +53,12 @@ def load_model(path: str, ctx: int, *, num_draft: int = 0, device: str = "cuda:0
                layers: int | None = None, mtp: Any = True, moe: str = "auto", prefill_chunk: int = 2048,
                engram_dir: str | None = None, threads: int | None = None, seed: int | None = None,
                draft_auto: Any = False, draft_conf_threshold: float | None = None, vision: Any = "auto", vision_device: str | None = None,
-               vision_dtype: str = "bfloat16", vision_cache: int = 8, **_: Any) -> PortEngine:
+               vision_dtype: str = "bfloat16", vision_cache: int = 8, split: dict | None = None, **_: Any) -> PortEngine:
+    if split is not None:
+        # serve.py turns --part0-* flags on into an injected split dict for every non-stub loader; this
+        # legacy loader cannot honor them, so say so instead of silently loading single-device
+        raise SystemExit("serve: the layer split (--part0-layers / --part0-device) needs the default loader "
+                         "(ds41_model:load_model); --loader ds41_serving:load_model does not implement it.")
     import torch
     if threads:
         torch.set_num_threads(int(threads))

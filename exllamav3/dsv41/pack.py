@@ -153,6 +153,25 @@ def subset_config(dcfg: DSV41Config, layers: int = None, mtp: bool = True) -> DS
     return c
 
 
+def _bind_src(src, mod, text_mtp) -> str:
+    """Wire one loaded module into the PackSource; the single dispatch shared by the split and split-off
+    load branches so a module key is handled in exactly one place. Returns the key. Trunk and MTP block
+    modules get src.add_block here; whether they join the `blocks` list is the caller's business (MTP
+    stages are walked via mtp_mod separately)."""
+    key = mod.key
+    if key == "embed":
+        src.embed = mod.embedding.weight.data
+    elif key == "norm":
+        src.norm = mod.w
+    elif key == "head":
+        src.lins["head"] = PackLin(mod.head)
+    elif key.startswith("layers.") or key.startswith("mtp."):
+        src.add_block(mod)
+    elif key == "mtp.extra":
+        src.add_extra(mod, text_mtp.main_proj)
+    return key
+
+
 def load(model_dir: str, device="cuda:0", dtype=torch.float16, layers: int = None, mtp: bool = True,
          moe: str = "auto", prefill_chunk: int = 2048, engram_store=None, log=None, placement=None, **kw):
     """Load the pack in `model_dir` into a `DSV41Serving` on `device`.
@@ -259,16 +278,10 @@ def load(model_dir: str, device="cuda:0", dtype=torch.float16, layers: int = Non
             before = torch.cuda.memory_allocated(dv)
             mod.load(dv)
             per_dev_bytes[dv] = per_dev_bytes.get(dv, 0) + (torch.cuda.memory_allocated(dv) - before)
-            key = mod.key
+            key = _bind_src(src, mod, text_mtp)
             log(f"loaded {key} on {dv}")
-            if key == "embed":
-                src.embed = mod.embedding.weight.data
-            elif key == "norm":
-                src.norm = mod.w
-            elif key == "head":
-                src.lins["head"] = PackLin(mod.head)
-            elif key.startswith("layers."):
-                src.add_block(mod)
+            if key.startswith("layers."):
+                blocks.append(mod)
                 blocks.append(mod)
             elif key == "mtp.extra":
                 src.add_extra(mod, text_mtp.main_proj)
@@ -277,31 +290,22 @@ def load(model_dir: str, device="cuda:0", dtype=torch.float16, layers: int = Non
         slab = None
         mtp_mod = text_mtp
     else:
+        mtp_mod = None
         for mod in text.modules:
             key = mod.key
             if key.startswith("layers.") and int(key.split(".")[1]) >= n_load:
                 continue
             mod.load(dev)
             log(f"loaded {key}")
-            if key == "embed":
-                src.embed = mod.embedding.weight.data
-            elif key == "norm":
-                src.norm = mod.w
-            elif key == "head":
-                src.lins["head"] = PackLin(mod.head)
-            elif key.startswith("layers."):
-                src.add_block(mod)
+            key = _bind_src(src, mod, mtp_mod)          # text modules never hit the mtp.* keys
+            if key.startswith("layers."):
                 blocks.append(mod)
-        mtp_mod = None
         if dcfg.n_mtp_layers:
             mtp_mod = Model.from_config(cfg, component="mtp")
             for mod in mtp_mod.modules:
                 mod.load(dev)
                 log(f"loaded {mod.key}")
-                if mod.key == "mtp.extra":
-                    src.add_extra(mod, mtp_mod.main_proj)
-                else:
-                    src.add_block(mod)
+                _bind_src(src, mod, mtp_mod)
 
     store = tm = mult = None
     if dcfg.engram_layer_ids:
@@ -361,13 +365,17 @@ def load(model_dir: str, device="cuda:0", dtype=torch.float16, layers: int = Non
             if front:
                 raise RuntimeError(f"split: front layers {front} registered with the expert tier")
             log(f"[split] expert tier on {tier_dev}; front layer(s) resident, no SSD reads")
-            lines = ", ".join(f"{dv}: {nb / 2**30:.2f} GiB" for dv, nb in per_dev_bytes.items())
-            log(f"[split] load table (weights): {lines}")
-            free = torch.cuda.mem_get_info(placement.part0)[0]
-            need = int(placement.part0_reserve_gb * (1 << 30))
-            log(f"[split] part0 free after load: {free / 2**30:.2f} GiB (reserve {placement.part0_reserve_gb:.2f} GiB)")
-            if free < need:
-                raise RuntimeError(f"split: part0 ({placement.part0}) has only {free / 2**30:.2f} GiB free after "
-                                   f"the load but the reserve wants {placement.part0_reserve_gb:.2f} GiB. "
-                                   "Reduce --part0-layers, use --endcaps off, or run with --num-draft 0.")
+    if split:
+        # split contract for every split load, tier or not: the load table and the part0 headroom check
+        # fail at load time instead of as a mid-prefill OOM
+        lines = ", ".join(f"{dv}: {nb / 2**30:.2f} GiB" for dv, nb in per_dev_bytes.items())
+        log(f"[split] load table (weights): {lines} (endcaps on {placement.endcap_device}, MTP on "
+            f"{placement.mtp_device}, expert tier on {tier_dev})")
+        free = torch.cuda.mem_get_info(placement.part0)[0]
+        need = int(placement.part0_reserve_gb * (1 << 30))
+        log(f"[split] part0 free after load: {free / 2**30:.2f} GiB (reserve {placement.part0_reserve_gb:.2f} GiB)")
+        if free < need:
+            raise RuntimeError(f"split: part0 ({placement.part0}) has only {free / 2**30:.2f} GiB free after "
+                               f"the load but the reserve wants {placement.part0_reserve_gb:.2f} GiB. "
+                               "Reduce --part0-layers, use --endcaps off, or run with --num-draft 0.")
     return model

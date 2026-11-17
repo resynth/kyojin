@@ -529,6 +529,42 @@ def _split_settings(split: dict | None):
 
 
 _SPLIT_ENV_DONE = False
+_SPLIT_ENV_KEYS = ("DSV41_DECODE_GRAPH", "KYOJIN_SPLIT_ACTIVE")
+_SPLIT_ENV_STATE: dict | None = None
+_SPLIT_DC_FORCED = None
+
+
+def _split_forced_keys():
+    from exllamav3.serve_split import SPLIT_UNSAFE_ENV, GRAPH_ENV_OFF
+    return tuple({**SPLIT_UNSAFE_ENV, **GRAPH_ENV_OFF}) + _SPLIT_ENV_KEYS
+
+
+def _snapshot_split_env():
+    """Capture everything a split-on load is about to force in this process (forced env keys and the
+    device_copy.FORCED flag install_bridge flips when the bridge is disabled), so a later split-off
+    load in the same process (harness A/B, eval loops loading several models) can go back to the
+    exact single-device contract."""
+    global _SPLIT_ENV_STATE, _SPLIT_DC_FORCED
+    if _SPLIT_ENV_STATE is not None:
+        return
+    import exllamav3.util.device_copy as dc
+    _SPLIT_ENV_STATE = {k: os.environ.get(k) for k in _split_forced_keys()}
+    _SPLIT_DC_FORCED = getattr(dc, "FORCED", None)         # None = autodetect, False, True: keep the exact value
+
+
+def _restore_split_env():
+    """Undo everything a previous split-on load left in this process, and re-arm the once-marker."""
+    global _SPLIT_ENV_STATE, _SPLIT_DC_FORCED, _SPLIT_ENV_DONE
+    if _SPLIT_ENV_STATE is None:
+        return
+    for k, v in _SPLIT_ENV_STATE.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+    import exllamav3.util.device_copy as dc
+    dc.FORCED = _SPLIT_DC_FORCED
+    _SPLIT_ENV_STATE, _SPLIT_DC_FORCED, _SPLIT_ENV_DONE = None, None, False
 
 
 def _apply_split_env_once(settings):
@@ -539,6 +575,7 @@ def _apply_split_env_once(settings):
         return
     from exllamav3.serve_split import SPLIT_UNSAFE_ENV, GRAPH_ENV_OFF, apply_split_env
     forced = {**SPLIT_UNSAFE_ENV, **GRAPH_ENV_OFF}
+    _snapshot_split_env()
     if all(os.environ.get(k) == v for k, v in forced.items()):
         _SPLIT_ENV_DONE = True                     # serve.py already applied it: no second log line
         return
@@ -547,14 +584,14 @@ def _apply_split_env_once(settings):
 
 
 def resolve_split(split: dict | None, pack_dir: str):
-    """Split dict / env -> (settings, DSV41Placement | None). Placement None = split off."""
+    """Split dict / env -> (settings, DSV41Placement | None). Placement None = split off. A split-off
+    resolve restores whatever an earlier split-on load forced in this process."""
     settings = _split_settings(split)
     if settings is None or not settings.enabled:
+        _restore_split_env()
         return settings, None
+    _snapshot_split_env()
     _apply_split_env_once(settings)
-    if settings.auto:
-        raise RuntimeError("DSV4 layer split needs a manual N (--part0-layers N / KYOJIN_PART0_LAYERS); "
-                           "auto-N is a later stage")
     import torch
     from exllamav3.device_map import resolve_devices
     from exllamav3.dsv41.config import DSV41Config

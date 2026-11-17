@@ -168,12 +168,6 @@ class DSV41Serving(DSV41Model):
     def loop_moe_for(self, dev) -> LoopMoE:
         return self._loop_moes.get(self._dk(dev), self.loop_moe) if hasattr(self, "_loop_moes") else self.loop_moe
 
-    def provider_for(self, dev) -> SourceExpertProvider:
-        return self._providers.get(self._dk(dev), self.provider) if hasattr(self, "_providers") else self.provider
-
-    def draft_device(self) -> torch.device:
-        return self._draft_device
-
     def _hop(self, t: torch.Tensor, dst) -> torch.Tensor:
         """Move `t` to `dst` for a split boundary. The bridge's host-staged hop, chunked once a crossing is
         big enough that the pinned staging must stay bounded; a plain to() when the bridge is disabled
@@ -667,6 +661,11 @@ class DSV41Serving(DSV41Model):
     def _engram_rows(self, hh, hashes, e, keep):
         """engram_inject on row blocks, written back in place (rows are independent): its gather / projection temporaries
         are ~450 KiB per row, so a 64K chunk would need ~30 GiB at once."""
+        if hashes is not None and hashes.device != hh.device:
+            # a split: the hasher (and its history) live on the home device, the engram layer may sit on the
+            # other one. The ids cross the boundary through the bridge's host-staged hop — torch.unique must
+            # run beside the gather it feeds ([B, L, n_cols] int64; direct D2D on this link class is slow).
+            hashes = self._hop(hashes, hh.device)
         cfg, L = self.cfg, hh.size(1)
         if L <= self.pf_eng_rows or hh.dtype != torch.float32 or not hh.is_contiguous():
             return engram_inject(hh, hashes, self.engram_store, e.pos, e.wkv, e.qk, cfg.hc_mult, cfg.hidden_size,
@@ -843,6 +842,10 @@ class DSV41Serving(DSV41Model):
             if seg_dev != s_dev:
                 # boundary crossing: materialize the hc stream (the delayed pre-mix keeps state that a fresh
                 # device cannot reconstruct), hop h and pre through the bridge, rebuild the stream there.
+                # apply() first on BOTH backends: HipStream.h applies the pending push via its property,
+                # but TorchStream.h is a plain attribute and would silently drop it (TorchStream.apply is
+                # what empties pend). apply() is a no-op when nothing is pending.
+                S.apply()
                 h = self._hop(S.h, seg_dev)
                 S = self.hc_for(seg_dev).new(h)
                 pre = self._hop(pre, seg_dev)
@@ -890,6 +893,8 @@ class DSV41Serving(DSV41Model):
         if d_cap != s_dev:
             # endcap epilogue on part0 while the stream ended on the home device: prefill needs only the last
             # row (mode "last"); a verify block ("all") is small enough to hop whole. mode "none" returns above.
+            # apply() first: same TorchStream.h caveat as the segment crossing above.
+            S.apply()
             if mode == "all":
                 S2 = self.hc_for(d_cap).new(self._hop(S.h, d_cap))
                 x = S2.cn(self._hop(pre, d_cap), self.norm_w)

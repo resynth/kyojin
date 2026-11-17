@@ -138,10 +138,6 @@ class DSV41Placement:
 
     # -- device rules ------------------------------------------------------
     @property
-    def n0(self) -> int:
-        return self.part0_layers
-
-    @property
     def part1(self) -> torch.device:
         return torch.device(self.devices.part1)
 
