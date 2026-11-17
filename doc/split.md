@@ -137,14 +137,18 @@ device selection, settings and bridge. Differences from the generic map:
   `KYOJIN_BRIDGE_CHUNK_MB` (default 256 MiB) ×2 slots instead of two full chunks.
 - **What fits a 16 GiB front.** `N=1` with endcaps on fits with headroom and is the measured
   setting: decode is faster than split-off and prefill is at parity (the row-blocked torch
-  prompt pass keeps the 32K single chunk on the card). A 94 GiB expert pool is the best
-  all-round budget (32K and 128K both safe); the split does **not** buy a materially larger
-  pool: the ~5 GiB of weights it moves to VRAM are largely offset by the bridge's pinned
-  staging and per-device state. The gain grows with context (decode +5 % at 32K, +9 % at
-  128K against split-off at the same/best pool), while a cold 128K prefill costs ~5 % extra.
-  `N=2` does not fit at 32K (with or without the endcaps on the front), and DSpark does not
-  fit next to layer 0 + endcaps; for MTP use `--endcaps off` (the head and the MTP stages
-  move to `part1`, the front keeps layer 0) or a front card with more memory.
+  prompt pass keeps the 32K single chunk on the card). A 94 GiB expert pool is the safe
+  all-round budget and 96 GiB is the practical maximum (32K floor 6.7, 128K floor 6.1; 98 is
+  killed). The split does **not** buy a materially larger pool: the ~5 GiB of weights it
+  moves to VRAM are largely offset by the bridge's pinned staging and per-device state. The
+  gain grows with context (decode +5 % at 32K, +9–13 % at 128K against split-off), while a
+  cold 128K prefill costs ~5 % extra. `N=2` fits 32K–128K with endcaps off and 1024-row front
+  blocks (prefill ~20 % slower; the default blocks miss 32K), so it is a context-fit
+  capability, not the throughput choice. `N=2` with endcaps on needs a 16K chunk (the
+  boundary stream is 2.5 GiB at 32K) and can reach pool 100, but at ~115 t/s prefill — the
+  absolute maximum, not a serving config. DSpark does not fit next to layer 0 + endcaps on a
+  16 GiB front even without the load guard; for MTP use `--endcaps off` (the head and the MTP
+  stages move to `part1`, the front keeps layer 0) or a front card with more memory.
 
 Example (the working orientation is the small card as `part0`):
 
